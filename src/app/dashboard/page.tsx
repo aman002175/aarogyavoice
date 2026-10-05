@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import {
   ArrowRight,
@@ -26,6 +26,14 @@ import {
   type Appointment,
   type AppointmentStatus,
 } from "@/lib/mock-data";
+import {
+  advanceQueue,
+  demoClinicId,
+  getQueueSocket,
+  isBackendConfigured,
+  type TokenAdvancedEvent,
+  type TokenBookedEvent,
+} from "@/lib/backend";
 
 const statusStyles: Record<AppointmentStatus, string> = {
   WAITING: "bg-amber-50 text-amber-700 ring-amber-200",
@@ -113,7 +121,44 @@ function CallsChart() {
 
 export default function DashboardPage() {
   const [appointments, setAppointments] = useState<Appointment[]>(demoAppointments);
-  const [isOpen, setIsOpen] = useState(demoClinic.isOpen);
+  const [isOpen, setIsOpen] = useState(!demoClinic.isOnHoliday);
+
+  // Live backend wiring. With NEXT_PUBLIC_BACKEND_URL set, the queue listens
+  // to the voice agent's Socket.io events — server events are the single
+  // source of truth. Without it, this page stays on demo data and behaves
+  // exactly as before.
+  useEffect(() => {
+    if (!isBackendConfigured) return;
+    const socket = getQueueSocket(demoClinicId);
+    const onBooked = (p: TokenBookedEvent) => {
+      setAppointments((prev) => [
+        ...prev,
+        {
+          id: `apt_${p.day}_${p.tokenNumber}`,
+          patientName: p.patientName,
+          tokenNumber: p.tokenNumber,
+          day: p.day,
+          reason: "Booked by voice",
+          status: "WAITING" as const,
+        },
+      ]);
+    };
+    const onAdvanced = (p: TokenAdvancedEvent) => {
+      setAppointments((prev) =>
+        prev.map((a) =>
+          a.tokenNumber === p.servedToken && a.status === "WAITING"
+            ? { ...a, status: "COMPLETED" as const }
+            : a,
+        ),
+      );
+    };
+    socket.on("token:booked", onBooked);
+    socket.on("token:advanced", onAdvanced);
+    return () => {
+      socket.off("token:booked", onBooked);
+      socket.off("token:advanced", onAdvanced);
+    };
+  }, []);
 
   // The queue is the single source of truth. The "now serving" token is
   // derived from the head of the queue, so cancelling or completing a patient
@@ -150,8 +195,14 @@ export default function DashboardPage() {
     [appointments],
   );
 
-  function callNext() {
+  async function callNext() {
     if (!serving) return;
+    if (isBackendConfigured) {
+      // The server advances the queue atomically and broadcasts
+      // `token:advanced`; updating locally here would race that event.
+      await advanceQueue(demoClinicId);
+      return;
+    }
     setAppointments((prev) =>
       prev.map((a) =>
         a.id === serving.id ? { ...a, status: "COMPLETED" as const } : a,
@@ -294,10 +345,20 @@ export default function DashboardPage() {
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
                   <h2 className="font-semibold text-ink-900">Live queue</h2>
-                  <p className="text-sm text-ink-400 tabular-nums">
+                  <p className="flex flex-wrap items-center gap-2 text-sm text-ink-400 tabular-nums">
                     {serving
                       ? `${rest.length} waiting · serving token ${serving.tokenNumber}`
                       : "Queue is clear"}
+                    <span
+                      className={cn(
+                        "rounded-md px-2 py-0.5 text-xs font-medium",
+                        isBackendConfigured
+                          ? "bg-brand-50 text-brand-700"
+                          : "bg-ink-100 text-ink-500",
+                      )}
+                    >
+                      {isBackendConfigured ? "Live" : "Demo data"}
+                    </span>
                   </p>
                 </div>
                 <span                    className={cn(
@@ -333,7 +394,7 @@ export default function DashboardPage() {
                     <Waveform bars={34} />
                   </div>
                   <Button
-                    onClick={callNext}
+                    onClick={() => void callNext()}
                     disabled={!serving || !isOpen}
                     size="lg"
                     className="mt-5 w-full sm:w-auto"
@@ -368,7 +429,8 @@ export default function DashboardPage() {
                           {appt.patientName}
                         </span>
                         <span className="block text-xs text-ink-400">
-                          {appt.time} · {appt.reason}
+                          {appt.day === "tomorrow" ? "Tomorrow" : "Today"} ·{" "}
+                          {appt.reason}
                         </span>
                       </span>
                     </span>
@@ -411,7 +473,8 @@ export default function DashboardPage() {
                         {appt.patientName}
                       </span>
                       <span className="mt-0.5 block text-xs text-ink-500">
-                        {appt.time} · {appt.reason}
+                        {appt.day === "tomorrow" ? "Tomorrow" : "Today"} ·{" "}
+                        {appt.reason}
                       </span>
                     </span>
                     <span
@@ -434,7 +497,7 @@ export default function DashboardPage() {
                     <th className="px-6 py-3 font-medium">Token</th>
                     <th className="px-6 py-3 font-medium">Patient</th>
                     <th className="px-6 py-3 font-medium">Reason</th>
-                    <th className="px-6 py-3 font-medium">Time</th>
+                    <th className="px-6 py-3 font-medium">Day</th>
                     <th className="px-6 py-3 font-medium">Status</th>
                   </tr>
                 </thead>
@@ -448,8 +511,8 @@ export default function DashboardPage() {
                         {appt.patientName}
                       </td>
                       <td className="px-6 py-3.5 text-ink-600">{appt.reason}</td>
-                      <td className="px-6 py-3.5 text-ink-600 tabular-nums">
-                        {appt.time}
+                      <td className="px-6 py-3.5 text-ink-600">
+                        {appt.day === "tomorrow" ? "Tomorrow" : "Today"}
                       </td>
                       <td className="px-6 py-3.5">
                         <span

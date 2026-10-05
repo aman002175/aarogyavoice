@@ -1,0 +1,23 @@
+{
+  "name": "aarogya-voice-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hosted voice AI orchestrator: Twilio Media Streams + Deepgram Nova-2/Aura + Groq Llama-3 + MongoDB + Socket.io. Replaces Vapi.ai.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "seed": "node seed.js"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "mongoose": "^8.9.5",
+    "socket.io": "^4.8.1",
+    "ws": "^8.18.0"
+  }
+}

@@ -1,15 +1,18 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { ArrowLeft, Clock } from "lucide-react";
 import { ButtonLink } from "@/components/button";
 import { Waveform } from "@/components/waveform";
+import { demoClinic, queueBoard, servingToken } from "@/lib/mock-data";
 import {
-  demoClinic,
-  queueBoard,
-  servingToken,
-  waitingQueue,
-} from "@/lib/mock-data";
+  demoClinicId,
+  getQueueSocket,
+  isBackendConfigured,
+  type TokenAdvancedEvent,
+  type TokenBookedEvent,
+} from "@/lib/backend";
 
 /**
  * Patient-facing waiting-room screen. Renders token numbers and wait times
@@ -17,7 +20,43 @@ import {
  * the doctor dashboard, behind a session we have not implemented yet.
  */
 export default function QueueDisplayPage() {
-  const token = servingToken;
+  // Demo-derived starting state; switches to live Socket.io updates when
+  // NEXT_PUBLIC_BACKEND_URL is set. Tokens only — never patient names.
+  const [serving, setServing] = useState(servingToken);
+  const [board, setBoard] = useState(queueBoard);
+
+  useEffect(() => {
+    if (!isBackendConfigured) return;
+    const socket = getQueueSocket(demoClinicId);
+    const onBooked = (p: TokenBookedEvent) => {
+      setBoard((prev) =>
+        [
+          ...prev,
+          {
+            token: p.tokenNumber,
+            wait: p.day === "tomorrow" ? "Tomorrow" : `${p.waitMinutes} min`,
+          },
+        ].sort((a, b) => a.token - b.token),
+      );
+    };
+    const onAdvanced = (p: TokenAdvancedEvent) => {
+      setServing(p.currentRunningToken);
+      setBoard((prev) =>
+        prev
+          .filter((r) => r.token > p.currentRunningToken)
+          .map((r, i) => ({
+            token: r.token,
+            wait: `${(i + 1) * demoClinic.avgMinutesPerToken} min`,
+          })),
+      );
+    };
+    socket.on("token:booked", onBooked);
+    socket.on("token:advanced", onAdvanced);
+    return () => {
+      socket.off("token:booked", onBooked);
+      socket.off("token:advanced", onAdvanced);
+    };
+  }, []);
 
   return (
     <div className="flex min-h-dvh flex-col bg-ink-950 text-clay-50">
@@ -48,7 +87,7 @@ export default function QueueDisplayPage() {
             Now serving
           </p>
           <p className="mt-3 text-8xl leading-none font-semibold tabular-nums text-brand-300 md:text-9xl">
-            {token}
+            {serving}
           </p>
           <div className="mt-8 h-10 w-56">
             <Waveform bars={26} />
@@ -80,8 +119,8 @@ export default function QueueDisplayPage() {
           </ul>
 
           <div className="mt-8 border-t border-white/10 pt-4 text-sm text-brand-100/50">
-            {demoClinic.slotDuration} minutes per patient ·{" "}
-            {Math.max(waitingQueue.length - 1, 0)} waiting
+            {demoClinic.avgMinutesPerToken} minutes per patient ·{" "}
+            {board.length} in queue
           </div>
         </section>
       </main>

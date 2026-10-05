@@ -1,5 +1,7 @@
 # 🏗️ System Architecture: AI Voice Receptionist
 
+> ⚠️ **SUPERSEDED (Oct 2026).** The Python/Pipecat + self-hosted Kokoro TTS pipeline described below has been dropped. Current stack: Node.js (Express + ws) orchestrator in **`voice-agent/`**, Deepgram Nova-2 (STT), **Deepgram Aura** (TTS, mulaw 8000Hz), Groq llama-3 (JSON actions), MongoDB, Socket.io. The Twilio Media Streams and multi-tenancy sections still apply. Live setup: [voice-agent/README.md](../voice-agent/README.md).
+
 ## 1. High-Level Overview
 Ye system ek multi-tenant SaaS hai jo clinics ke liye 24/7 AI voice receptionist provide karta hai. System ko do alag parts mein divide kiya gaya hai taaki latency aur scalability maintain rahe.
 

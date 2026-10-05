@@ -1,0 +1,776 @@
+/**
+ * Aarogya Voice — self-hosted voice AI orchestrator ("voice-agent").
+ *
+ * Replaces Vapi.ai. One long-running Node.js process that:
+ *   1. Answers Twilio's webhook with TwiML that hands the call to a Media Stream.
+ *   2. Receives patient audio (mulaw 8000Hz) over WebSocket and streams it to
+ *      Deepgram Nova-2 (STT, also over WebSocket).
+ *   3. Injects LIVE clinic state (MongoDB) into a Groq llama-3 system prompt
+ *      on every turn (dynamic context injection — current token, next token,
+ *      wait estimate, holiday flag).
+ *   4. Parses the LLM's JSON action (e.g. {"action":"book_token", ...}).
+ *   5. Assigns the REAL token server-side with an atomic $inc (the LLM never
+ *      gets to pick the token number — that would race), persists Patient +
+ *      Appointment, and emits Socket.io events to the Next.js dashboard.
+ *   6. Speaks replies through Deepgram Aura (TTS over WebSocket, mulaw 8000Hz
+ *      back into the Twilio media stream).
+ *
+ * Multi-tenancy rule (security): the clinic is ALWAYS resolved server-side —
+ * from the Twilio `To` number in the webhook, then carried into the stream as
+ * a custom parameter. The LLM is never trusted to supply a clinic_id.
+ *
+ * Run: see env.example, then `node server.js`.
+ */
+
+require("dotenv").config();
+
+const http = require("http");
+const crypto = require("crypto");
+const express = require("express");
+const cors = require("cors");
+const mongoose = require("mongoose");
+const { Server: SocketServer } = require("socket.io");
+const { WebSocket, WebSocketServer } = require("ws");
+
+const { Clinic, Patient, Appointment } = require("./models");
+
+// ---------------------------------------------------------------------------
+// Boot-time config validation
+// ---------------------------------------------------------------------------
+
+const REQUIRED_ENV = [
+  "MONGO_URI",
+  "DEEPGRAM_API_KEY",
+  "GROQ_API_KEY",
+  "TWILIO_AUTH_TOKEN",
+  "PUBLIC_BASE_URL",
+  "PUBLIC_WS_URL",
+];
+const missing = REQUIRED_ENV.filter((key) => !process.env[key]);
+if (missing.length > 0) {
+  console.error(
+    `[voice-agent] Missing required env vars: ${missing.join(", ")} — see voice-agent/env.example`
+  );
+  process.exit(1);
+}
+
+const PORT = process.env.PORT || 8080;
+const STT_MODEL = process.env.DEEPGRAM_STT_MODEL || "nova-2";
+const STT_LANGUAGE = process.env.DEEPGRAM_LANGUAGE || "multi";
+const TTS_MODEL = process.env.DEEPGRAM_TTS_MODEL || "aura-asteria-en";
+const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3-8b-8192";
+
+const log = {
+  info: (...args) => console.log(`[voice-agent ${new Date().toISOString()}]`, ...args),
+  error: (...args) => console.error(`[voice-agent ${new Date().toISOString()}]`, ...args),
+};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Normalize a phone to loose E.164 ("tel:+91140...", "0114..." -> keep digits + leading +). */
+function normalizePhone(raw) {
+  if (!raw) return "";
+  const trimmed = String(raw).replace(/^tel:/i, "").replace(/[\s()-]/g, "");
+  return trimmed.startsWith("+") ? "+" + trimmed.slice(1).replace(/\D/g, "") : trimmed.replace(/\D/g, "");
+}
+
+/**
+ * Validate Twilio's X-Twilio-Signature header (HMAC-SHA1 over the full URL +
+ * alphabetically-sorted POST params). The old Vapi HMAC snippet in the docs
+ * never existed; Twilio's real signature scheme is what must be enforced here.
+ */
+function isTwilioRequestValid(req) {
+  if (process.env.TWILIO_SKIP_SIGNATURE_CHECK === "true") {
+    log.error("TWILIO_SKIP_SIGNATURE_CHECK is enabled — dev only, never ship this way");
+    return true;
+  }
+  const signature = req.headers["x-twilio-signature"];
+  const authToken = process.env.TWILIO_AUTH_TOKEN;
+  if (!signature || !authToken) return false;
+  const url = `${process.env.PUBLIC_BASE_URL.replace(/\/+$/, "")}/twilio/voice`;
+  const data = Object.keys(req.body || {})
+    .sort()
+    .reduce((acc, key) => acc + key + req.body[key], url);
+  const expected = crypto
+    .createHmac("sha1", authToken)
+    .update(Buffer.from(data, "utf8"))
+    .digest("base64");
+  const a = Buffer.from(expected);
+  const b = Buffer.from(signature);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+const sayTwiml = (text) =>
+  `<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="Polly.Aditi" language="hi-IN">${text}</Say><Hangup/></Response>`;
+
+function serializeClinic(c) {
+  return {
+    id: c._id,
+    clinicName: c.clinic_name,
+    doctorName: c.doctor_name,
+    twilioNumber: c.twilio_number,
+    isOnHoliday: c.is_on_holiday,
+    currentRunningToken: c.current_running_token,
+    lastAssignedToken: c.last_assigned_token,
+    avgMinutesPerToken: c.avg_minutes_per_token,
+    newPatientFee: c.config?.new_patient_fee ?? 100,
+  };
+}
+
+function estimateWaitMinutes(clinic, forToken) {
+  const per = clinic.avg_minutes_per_token || 15;
+  return Math.max(0, (forToken - (clinic.current_running_token || 0)) * per);
+}
+
+/**
+ * The dynamic system prompt. Rebuilt on EVERY LLM turn from a fresh Mongo read,
+ * so wait estimates never go stale mid-call.
+ */
+function buildSystemPrompt(clinic, callerPhone) {
+  const nextToken = (clinic.last_assigned_token || 0) + 1;
+  const waitMinutes = estimateWaitMinutes(clinic, nextToken);
+  const fee = clinic.config?.new_patient_fee ?? 100;
+  const hours = `${clinic.config?.start_time || "09:00"} se ${clinic.config?.end_time || "17:00"}`;
+  const status = clinic.is_on_holiday
+    ? "AAJ CLINIC CHHUTTI PAR HAI (band hai)"
+    : `Khula hai. Timings: ${hours}`;
+
+  return `Tum "Priya" ho — ${clinic.clinic_name} (Doctor ${clinic.doctor_name}) ki AI receptionist. Natural, conversational Hinglish bolo (Hindi + English mix).
+
+LIVE CLINIC STATE (server ne abhi inject kiya hai — hamesha isi ka use karo, apne pehle ke statements par bharosa mat karo):
+- Clinic status: ${status}
+- Current running token: ${clinic.current_running_token} (ye token abhi doctor ke paas hai)
+- Last assigned token: ${clinic.last_assigned_token} (agla token ${nextToken} hoga)
+- Estimated wait for token ${nextToken}: ~${waitMinutes} minute (${clinic.avg_minutes_per_token} min per token)
+- Nayi file (parchi) fee: ₹${fee}
+- Caller ka phone (Twilio se verified): ${callerPhone || "unknown"}
+
+RULES:
+1. Output sirf EK JSON object ho, koi extra text nahi. Schema:
+   {"reply": "<jo patient ko bolna hai, Hinglish>", "action": "none" | "book_token" | "end_call", "patient_name": "<string ya null>", "phone": "<string ya null>", "day": "today" | "tomorrow"}
+2. action "book_token" TABHI jab patient ne apna naam de diya ho aur confirm kar diya ho. Phone na mile to "phone": null chhodo — server caller-ID use karega.
+3. Clinic chhutti par hai to pehle clearly batao ki aaj band hai, aur booking "day": "tomorrow" offer karo.
+4. Tum sirf appointment/timings/info desk ho. Medical advice KABHI nahi: "Sir/Ma'am, main medical advice nahi de sakti, appointment book kar lete hain."
+5. Chhote jawab do — ek-do line. Ye phone call hai. Jab relevant ho, live token/wait status use karo.
+6. Token number TUM assign nahi karti — booking ke baad server final token bolega. Isliye kisi naye token number ka specific claim apni reply me mat karo.`;
+}
+
+/** Groq chat completion, forced into JSON mode. Returns a normalized action object. */
+async function callGroq(systemPrompt, history, userText) {
+  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: GROQ_MODEL,
+      temperature: 0.3,
+      max_tokens: 220,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: systemPrompt },
+        ...history,
+        { role: "user", content: userText },
+      ],
+    }),
+  });
+  if (!res.ok) {
+    const body = (await res.text()).slice(0, 300);
+    throw new Error(`Groq API ${res.status}: ${body}`);
+  }
+  const data = await res.json();
+  const raw = data.choices?.[0]?.message?.content || "";
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    const match = raw.match(/\{[\s\S]*\}/);
+    try {
+      parsed = match ? JSON.parse(match[0]) : null;
+    } catch {
+      parsed = null;
+    }
+  }
+  if (!parsed || typeof parsed.reply !== "string") {
+    // JSON mode can still fail on edge inputs; degrade gracefully to raw text.
+    return { reply: raw.slice(0, 300) || "Ji, bataiye.", action: "none" };
+  }
+  return {
+    reply: parsed.reply,
+    action: parsed.action,
+    patient_name: parsed.patient_name,
+    phone: parsed.phone,
+    day: parsed.day,
+  };
+}
+
+/** End the Twilio call leg via the REST API (used for clean hangups). */
+async function completeCall(callSid) {
+  const sid = process.env.TWILIO_ACCOUNT_SID;
+  const token = process.env.TWILIO_AUTH_TOKEN;
+  if (!sid || !token || !callSid) return;
+  try {
+    await fetch(`https://api.twilio.com/2010-04-01/Accounts/${sid}/Calls/${callSid}.json`, {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${Buffer.from(`${sid}:${token}`).toString("base64")}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({ Status: "completed" }),
+    });
+  } catch (err) {
+    log.error("completeCall failed:", err.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Booking — the atomic, race-safe path
+// ---------------------------------------------------------------------------
+
+/**
+ * Assign the next token with findOneAndUpdate({ $inc }) so two simultaneous
+ * calls can never receive the same token. The LLM's suggested number (if any)
+ * is intentionally ignored — the server's counter is the only source of truth.
+ */
+async function handleBookToken(session, clinicId, llm) {
+  const phone = normalizePhone(llm.phone || session.callerPhone || "");
+  if (!llm.patient_name || !phone) return null;
+
+  const clinic = await Clinic.findById(clinicId);
+  if (!clinic) return null;
+
+  const updated = await Clinic.findOneAndUpdate(
+    { _id: clinic._id },
+    { $inc: { last_assigned_token: 1 } },
+    { new: true }
+  );
+  const token = updated.last_assigned_token;
+
+  const existing = await Patient.findOne({ clinic_id: clinic._id, phone_number: phone });
+  const patient = await Patient.findOneAndUpdate(
+    { clinic_id: clinic._id, phone_number: phone },
+    { $setOnInsert: { clinic_id: clinic._id, phone_number: phone, name: llm.patient_name } },
+    { upsert: true, new: true }
+  );
+
+  const day = llm.day === "tomorrow" ? "tomorrow" : "today";
+  await Appointment.create({
+    clinic_id: clinic._id,
+    patient_id: patient._id,
+    token_number: token,
+    day,
+    status: "WAITING",
+    fee_paid: false,
+    booked_via: "ai_call",
+    notes: existing ? undefined : "New patient — parchi fee at counter",
+  });
+
+  const waitMinutes = day === "today" ? estimateWaitMinutes(updated, token) : 0;
+  const payload = {
+    clinicId: clinic._id,
+    tokenNumber: token,
+    patientName: llm.patient_name,
+    day,
+    waitMinutes,
+    lastAssignedToken: updated.last_assigned_token,
+  };
+  io.to(`clinic:${clinic._id}`).emit("token:booked", payload);
+
+  return {
+    ok: true,
+    name: llm.patient_name,
+    token,
+    waitMinutes,
+    day,
+    isNewPatient: !existing,
+    fee: updated.config?.new_patient_fee ?? 100,
+  };
+}
+
+function bookingConfirmationText(r) {
+  const waitStr =
+    r.waitMinutes >= 60
+      ? `${Math.floor(r.waitMinutes / 60)} ghante ${r.waitMinutes % 60} minute`
+      : `${r.waitMinutes} minute`;
+  const parchi = r.isNewPatient && r.fee > 0 ? ` Naya patient hain, isliye counter par ₹${r.fee} ki parchi lagegi.` : "";
+  if (r.day === "tomorrow") {
+    return `Ji ${r.name}, confirm — kal aapka token number ${r.token} ho gaya hai. Aap aayein, yahi number pukara jayega.${parchi} Dhanyavaad!`;
+  }
+  return `Ji ${r.name}, confirm — aapka token number ${r.token} ho gaya hai. Lagbhag ${waitStr} ka wait hai.${parchi} Dhanyavaad!`;
+}
+
+// ---------------------------------------------------------------------------
+// Express app — webhook + REST API
+// ---------------------------------------------------------------------------
+
+const app = express();
+app.use(express.urlencoded({ extended: false })); // Twilio webhooks POST form-encoded
+app.use(express.json());
+app.use(cors({ origin: process.env.FRONTEND_URL || "*", methods: ["GET", "POST"] }));
+
+app.get("/healthz", (_req, res) => res.json({ ok: true, activeCalls: activeSessions.size }));
+
+/**
+ * Twilio incoming-call webhook. Resolves the tenant from the `To` number and
+ * returns TwiML that connects the call to our Media Stream. NOTE: this is the
+ * TwiML that DEPLOYMENT_GUIDE.md was missing — Twilio console only needs this
+ * URL + HTTP POST; everything else happens here.
+ */
+app.post("/twilio/voice", async (req, res) => {
+  try {
+    if (!isTwilioRequestValid(req)) {
+      return res.status(403).type("text/xml").send(sayTwiml("Unauthorized request."));
+    }
+    const to = normalizePhone(req.body.To);
+    const from = normalizePhone(req.body.From);
+    const callSid = req.body.CallSid || "";
+
+    const clinic = await Clinic.findOne({ twilio_number: to, is_active: true });
+    if (!clinic) {
+      log.info(`call ${callSid}: no clinic owns ${to} — rejecting`);
+      return res.type("text/xml").send(sayTwiml("Sorry, is number par abhi koi clinic active nahi hai."));
+    }
+
+    log.info(`call ${callSid}: resolved clinic ${clinic._id} (${clinic.clinic_name})`);
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="${process.env.PUBLIC_WS_URL}">
+      <Parameter name="clinicId" value="${clinic._id.toString()}"/>
+      <Parameter name="callerPhone" value="${from}"/>
+    </Stream>
+  </Connect>
+</Response>`;
+    return res.type("text/xml").send(twiml);
+  } catch (err) {
+    log.error("/twilio/voice failed:", err);
+    return res.type("text/xml").send(sayTwiml("Maaf kijiye, system mein dikkat hai. Kripya baad mein call karein."));
+  }
+});
+
+/**
+ * Dashboard "Next Patient" button. Advances the queue atomically and pushes a
+ * Socket.io event so every connected dashboard updates instantly.
+ */
+app.post("/api/clinic/next-token", async (req, res) => {
+  try {
+    const { clinicId } = req.body || {};
+    if (!clinicId || !/^[a-f\d]{24}$/i.test(clinicId)) {
+      return res.status(400).json({ error: "clinicId (24-hex) is required" });
+    }
+    // TODO(auth): verify the dashboard JWT and that this user belongs to
+    // clinicId before mutating anything.
+
+    const clinic = await Clinic.findById(clinicId);
+    if (!clinic) return res.status(404).json({ error: "Clinic not found" });
+    if (clinic.current_running_token >= clinic.last_assigned_token) {
+      return res.status(409).json({ error: "Queue already caught up — no waiting tokens", clinic: serializeClinic(clinic) });
+    }
+
+    // Atomic pipeline update: within one $set stage all expressions read the
+    // pre-update doc, so token_history pushes the OLD current token.
+    const updated = await Clinic.findOneAndUpdate(
+      { _id: clinic._id },
+      [
+        {
+          $set: {
+            last_served_token: "$current_running_token",
+            current_running_token: { $add: ["$current_running_token", 1] },
+            token_history: {
+              $concatArrays: [
+                { $slice: ["$token_history", -499] },
+                [{ token: "$current_running_token", served_at: "$$NOW" }],
+              ],
+            },
+          },
+        },
+      ],
+      { new: true }
+    );
+
+    const servedToken = updated.last_served_token;
+    await Appointment.updateMany(
+      { clinic_id: updated._id, token_number: servedToken, status: "WAITING" },
+      { $set: { status: "COMPLETED" } }
+    );
+
+    const payload = {
+      clinicId: updated._id,
+      servedToken,
+      currentRunningToken: updated.current_running_token,
+      lastAssignedToken: updated.last_assigned_token,
+    };
+    io.to(`clinic:${updated._id}`).emit("token:advanced", payload);
+    return res.json(payload);
+  } catch (err) {
+    log.error("/api/clinic/next-token failed:", err);
+    return res.status(500).json({ error: "Internal error" });
+  }
+});
+
+/** Initial dashboard hydration before the Socket.io subscription kicks in. */
+app.get("/api/clinic/:id/state", async (req, res) => {
+  try {
+    const clinic = await Clinic.findById(req.params.id);
+    if (!clinic) return res.status(404).json({ error: "Clinic not found" });
+    const waiting = await Appointment.find({ clinic_id: clinic._id, status: "WAITING", day: "today" })
+      .sort({ token_number: 1 })
+      .populate("patient_id", "name phone_number")
+      .lean();
+    return res.json({ clinic: serializeClinic(clinic), waiting });
+  } catch (err) {
+    log.error("/api/clinic/:id/state failed:", err);
+    return res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Socket.io — real-time push to the Next.js frontend
+// ---------------------------------------------------------------------------
+
+const server = http.createServer(app);
+const io = new SocketServer(server, {
+  path: "/socket.io",
+  cors: { origin: process.env.FRONTEND_URL || "*", methods: ["GET", "POST"] },
+});
+
+io.on("connection", (socket) => {
+  const clinicId = socket.handshake.auth?.clinicId;
+  if (clinicId && /^[a-f\d]{24}$/i.test(clinicId)) {
+    socket.join(`clinic:${clinicId}`);
+    log.info(`socket ${socket.id} subscribed to clinic:${clinicId}`);
+  }
+  socket.on("clinic:unsubscribe", (id) => {
+    if (id) socket.leave(`clinic:${id}`);
+  });
+});
+
+// Events emitted to rooms (documented contract for the frontend):
+//   "token:booked"   -> { clinicId, tokenNumber, patientName, day, waitMinutes, lastAssignedToken }
+//   "token:advanced" -> { clinicId, servedToken, currentRunningToken, lastAssignedToken }
+
+// ---------------------------------------------------------------------------
+// WebSocket — Twilio Media Streams
+// ---------------------------------------------------------------------------
+
+const wss = new WebSocketServer({ server, path: "/media-stream" });
+const activeSessions = new Set();
+
+wss.on("connection", (twilioWs) => {
+  const session = {
+    twilioWs,
+    streamSid: null,
+    callSid: null,
+    clinicId: null,
+    callerPhone: "",
+    dg: null,
+    tts: null,
+    dgKeepAlive: null,
+    utteranceBuffer: "",
+    history: [],
+    thinking: false,
+    pendingUtterance: null,
+    ttsQueue: [],
+    ttsBusy: false,
+    closed: false,
+  };
+  activeSessions.add(session);
+
+  twilioWs.on("message", (raw) => {
+    if (session.closed) return;
+    let msg;
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
+    try {
+      switch (msg.event) {
+        case "start":
+          void onStreamStart(session, msg.start || {}).catch((err) => {
+            log.error("onStreamStart failed:", err);
+            closeSession(session);
+          });
+          break;
+        case "media":
+          // Twilio media payload = base64 mulaw 8000Hz -> straight to Deepgram.
+          if (session.dg && session.dg.readyState === WebSocket.OPEN) {
+            session.dg.send(Buffer.from(msg.media.payload, "base64"));
+          }
+          break;
+        case "stop":
+          closeSession(session);
+          break;
+        case "mark":
+        case "connected":
+          break; // acknowledged implicitly; barge-in via marks is a follow-up
+        default:
+          break;
+      }
+    } catch (err) {
+      log.error("WS message handling failed:", err);
+    }
+  });
+
+  twilioWs.on("close", () => closeSession(session));
+  twilioWs.on("error", (err) => {
+    log.error("Twilio WS error:", err.message);
+    closeSession(session);
+  });
+});
+
+async function onStreamStart(session, start) {
+  session.streamSid = start.streamSid || null;
+  session.callSid = start.callSid || null;
+  const params = start.customParameters || {};
+  session.clinicId = params.clinicId || null;
+  session.callerPhone = normalizePhone(params.callerPhone || "");
+
+  if (!session.clinicId || !/^[a-f\d]{24}$/i.test(session.clinicId)) {
+    log.error(`call ${session.callSid}: missing/invalid clinicId custom parameter — hanging up`);
+    await completeCall(session.callSid);
+    closeSession(session);
+    return;
+  }
+
+  const clinic = await Clinic.findById(session.clinicId);
+  if (!clinic || !clinic.is_active) {
+    log.error(`call ${session.callSid}: clinic ${session.clinicId} not found/inactive — hanging up`);
+    await completeCall(session.callSid);
+    closeSession(session);
+    return;
+  }
+
+  log.info(`call ${session.callSid}: stream started for clinic ${clinic.clinic_name}`);
+  openTTS(session, clinic); // greeting speaks as soon as the TTS socket opens
+  openSTT(session);
+}
+
+// ----------------------------- Deepgram STT --------------------------------
+
+function openSTT(session) {
+  const params = new URLSearchParams({
+    model: STT_MODEL,
+    language: STT_LANGUAGE, // "multi" handles Hinglish; "hi"/"en" for pure
+    encoding: "mulaw",
+    sample_rate: "8000",
+    channels: "1",
+    punctuate: "true",
+    smart_format: "true",
+    endpointing: "350",
+    utterance_end_ms: "1200",
+    interim_results: "false",
+  });
+  const dg = new WebSocket(`wss://api.deepgram.com/v1/listen?${params}`, {
+    headers: { Authorization: `Token ${process.env.DEEPGRAM_API_KEY}` },
+  });
+  session.dg = dg;
+
+  dg.on("open", () => log.info(`call ${session.callSid}: Deepgram STT connected`));
+  dg.on("message", (data, isBinary) => {
+    if (isBinary || session.closed) return;
+    let msg;
+    try {
+      msg = JSON.parse(data.toString());
+    } catch {
+      return;
+    }
+    if (msg.type === "Results" && msg.is_final) {
+      const text = msg.channel?.alternatives?.[0]?.transcript?.trim();
+      if (text) session.utteranceBuffer = `${session.utteranceBuffer} ${text}`.trim();
+    } else if (msg.type === "UtteranceEnd") {
+      const utterance = session.utteranceBuffer;
+      session.utteranceBuffer = "";
+      if (utterance) void processUtterance(session, utterance);
+    }
+  });
+  dg.on("error", (err) => log.error(`call ${session.callSid}: Deepgram STT error:`, err.message));
+  dg.on("close", () => log.info(`call ${session.callSid}: Deepgram STT closed`));
+
+  session.dgKeepAlive = setInterval(() => {
+    if (dg.readyState === WebSocket.OPEN) dg.send(JSON.stringify({ type: "KeepAlive" }));
+  }, 5000);
+}
+
+// ----------------------------- LLM turn ------------------------------------
+
+async function processUtterance(session, userText) {
+  if (session.closed) return;
+  if (session.thinking) {
+    // Patient spoke again while we were reasoning — handle the latest after.
+    session.pendingUtterance = userText;
+    return;
+  }
+  session.thinking = true;
+  try {
+    // Fresh read every turn: the prompt always carries live token state.
+    const clinic = await Clinic.findById(session.clinicId);
+    if (!clinic) throw new Error("clinic disappeared mid-call");
+
+    const llm = await callGroq(
+      buildSystemPrompt(clinic, session.callerPhone),
+      session.history.slice(-10),
+      userText
+    );
+
+    let assistantText = llm.reply;
+    if (llm.action === "book_token") {
+      const result = await handleBookToken(session, session.clinicId, llm);
+      if (result) {
+        assistantText = bookingConfirmationText(result);
+      } else {
+        assistantText = "Ji, token book karne ke liye pehle apna naam bata dijiye, phir main confirm kar deti hoon.";
+      }
+    } else if (llm.action === "end_call") {
+      setTimeout(() => completeCall(session.callSid), 3000); // after TTS finishes
+    }
+
+    session.history.push({ role: "user", content: userText }, { role: "assistant", content: assistantText });
+    if (session.history.length > 20) session.history = session.history.slice(-20);
+
+    speak(session, assistantText);
+  } catch (err) {
+    log.error(`call ${session.callSid}: turn failed:`, err.message);
+    speak(session, "Maaf kijiye, system mein thodi dikkat aa rahi hai. Kripya thodi der baad dobara call karein.");
+  } finally {
+    session.thinking = false;
+    if (session.pendingUtterance && !session.closed) {
+      const next = session.pendingUtterance;
+      session.pendingUtterance = null;
+      void processUtterance(session, next);
+    }
+  }
+}
+
+// ----------------------------- Deepgram Aura TTS ---------------------------
+
+function openTTS(session, clinic) {
+  const params = new URLSearchParams({
+    model: TTS_MODEL,
+    encoding: "mulaw", // Twilio-native format straight back into the stream
+    sample_rate: "8000",
+    container: "none",
+  });
+  const tts = new WebSocket(`wss://api.deepgram.com/v1/speak?${params}`, {
+    headers: { Authorization: `Token ${process.env.DEEPGRAM_API_KEY}` },
+  });
+  session.tts = tts;
+
+  tts.on("open", () => {
+    log.info(`call ${session.callSid}: Deepgram TTS connected`);
+    speak(session, greetingText(clinic));
+  });
+  tts.on("message", (data, isBinary) => {
+    if (session.closed) return;
+    if (isBinary) {
+      sendMedia(session, data); // raw mulaw (container=none) -> Twilio
+      return;
+    }
+    let msg;
+    try {
+      msg = JSON.parse(data.toString());
+    } catch {
+      return;
+    }
+    if (msg.type === "Finished" || msg.type === "Flushed") {
+      session.ttsBusy = false;
+      pumpTTS(session);
+    }
+  });
+  tts.on("error", (err) => log.error(`call ${session.callSid}: Deepgram TTS error:`, err.message));
+  tts.on("close", () => log.info(`call ${session.callSid}: Deepgram TTS closed`));
+}
+
+function greetingText(clinic) {
+  if (clinic.is_on_holiday) {
+    return `Namaste! ${clinic.clinic_name} aaj chhutti par hai. Kya main aapke liye kal ka token book kar doon?`;
+  }
+  const nextToken = (clinic.last_assigned_token || 0) + 1;
+  const waitMinutes = estimateWaitMinutes(clinic, nextToken);
+  return `Namaste! ${clinic.clinic_name} mein aapka swagat hai. Abhi token number ${clinic.current_running_token} chal raha hai, isliye agle token par lagbhag ${waitMinutes} minute ka wait hai. Bataiye, main aapka token book kar doon?`;
+}
+
+function splitSentences(text) {
+  const parts = text
+    .split(/(?<=[.?!।])\s+/)
+    .flatMap((s) => (s.length <= 280 ? [s] : s.match(/.{1,280}(\s|$)/g) || [s]))
+    .filter(Boolean);
+  return parts;
+}
+
+function speak(session, text) {
+  if (!text || session.closed) return;
+  session.ttsQueue.push(...splitSentences(text));
+  pumpTTS(session);
+}
+
+function pumpTTS(session) {
+  const tts = session.tts;
+  if (!tts || tts.readyState !== WebSocket.OPEN || session.ttsBusy || session.ttsQueue.length === 0) return;
+  session.ttsBusy = true;
+  const text = session.ttsQueue.shift();
+  tts.send(JSON.stringify({ type: "Speak", text }));
+  tts.send(JSON.stringify({ type: "Flush" })); // force end-of-audio so "Finished" fires
+}
+
+function sendMedia(session, mulawBuffer) {
+  if (!session.twilioWs || session.twilioWs.readyState !== WebSocket.OPEN || !session.streamSid) return;
+  session.twilioWs.send(
+    JSON.stringify({
+      event: "media",
+      streamSid: session.streamSid,
+      media: { payload: mulawBuffer.toString("base64") },
+    })
+  );
+}
+
+// ----------------------------- teardown ------------------------------------
+
+function closeSession(session) {
+  if (session.closed) return;
+  session.closed = true;
+  if (session.dgKeepAlive) clearInterval(session.dgKeepAlive);
+  for (const ws of [session.dg, session.tts]) {
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+      try {
+        ws.close();
+      } catch {
+        /* already dying */
+      }
+    }
+  }
+  activeSessions.delete(session);
+  log.info(`call ${session.callSid || "?"}: session closed (active: ${activeSessions.size})`);
+}
+
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
+
+mongoose
+  .connect(process.env.MONGO_URI, { serverSelectionTimeoutMS: 10000 }) // fail fast on a bad URI instead of retrying for 30s
+  .then(() => {
+    log.info("MongoDB connected");
+    server.listen(PORT, () => {
+      log.info(`voice-agent listening on :${PORT}`);
+      log.info(`  webhook  POST ${process.env.PUBLIC_BASE_URL}/twilio/voice`);
+      log.info(`  stream   ${process.env.PUBLIC_WS_URL}`);
+    });
+  })
+  .catch((err) => {
+    log.error("MongoDB connection failed:", err.message);
+    process.exit(1);
+  });
+
+process.on("unhandledRejection", (reason) => log.error("Unhandled rejection:", reason));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
+function shutdown(signal) {
+  log.info(`${signal} received — draining ${activeSessions.size} active call(s)`);
+  server.close(() => mongoose.connection.close(false).then(() => process.exit(0)));
+  setTimeout(() => process.exit(0), 8000).unref();
+}

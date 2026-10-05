@@ -6,9 +6,10 @@ export function cn(...inputs: ClassValue[]) {
 }
 
 /**
- * Frontend-only configuration. The backend is not wired yet, so the app runs
- * entirely on mock data. Real values are injected later from the env keys the
- * README documents (VAPI_API_KEY, MONGO_URI, BACKEND_URL, ...).
+ * Frontend-only configuration. The voice backend (voice-agent/) is not wired
+ * yet, so the app runs entirely on mock data. Real values are injected later
+ * from the env keys voice-agent/env.example documents (MONGO_URI,
+ * TWILIO_AUTH_TOKEN, DEEPGRAM_API_KEY, GROQ_API_KEY, ...).
  */
 export const appConfig = {
   name: "Aarogya Voice",
@@ -19,7 +20,7 @@ export const appConfig = {
 export const hero = {
   eyebrow: "Answers in Hindi and English",
   title: "Your clinic's receptionist, on duty 24/7",
-  body: "Aarogya Voice picks up every patient call, tells them where they stand in the queue, and books the slot while you stay with the patient in front of you.",
+  body: "Aarogya Voice picks up every patient call, tells them where they stand in the queue, and books the token while you stay with the patient in front of you.",
   primaryCta: "Start 14-day free trial",
   secondaryCta: "See the queue display",
   reassurance: "No credit card · Your own phone number · Cancel anytime",
@@ -34,7 +35,7 @@ export const howItWorks = [
   {
     n: "02",
     title: "It handles the conversation",
-    body: "It gives live queue status, an honest wait estimate, your clinic hours, and books a slot if one is free.",
+    body: "It gives live queue status, an honest wait estimate, your clinic hours, and books a token when the queue is open.",
   },
   {
     n: "03",
@@ -62,7 +63,7 @@ export const features = [
   {
     icon: "calendar",
     title: "Books while it talks",
-    body: "Available slots fill from the call itself. No follow-up phone tag, no no-shows.",
+    body: "Tokens fill from the call itself. No follow-up phone tag, no no-shows.",
   },
   {
     icon: "shield",
@@ -87,7 +88,7 @@ export const pricingPlans = [
     features: [
       "1 dedicated clinic phone number",
       "Live token queue display",
-      "Appointment booking by voice",
+      "Token booking by voice",
       "Hindi + English voice",
       "Email support",
     ],
@@ -105,7 +106,7 @@ export const pricingPlans = [
       "Everything in Starter",
       "Unlimited queue display screens",
       "SMS + WhatsApp confirmations",
-      "Clinic hours & slot rules",
+      "Clinic hours & holiday controls",
       "Priority support",
     ],
     cta: "Start free trial",
@@ -133,7 +134,7 @@ export const pricingPlans = [
 export const faqs = [
   {
     q: "Does it work when my clinic is closed?",
-    a: "Yes. Aarogya Voice stays live around the clock. When the clinic is closed, it tells the caller your working hours and offers to book a slot for the next open day instead of a dead line.",
+    a: "Yes. Aarogya Voice stays live around the clock. When the clinic is closed, it tells the caller your working hours and offers to book a token for the next open day instead of a dead line.",
   },
   {
     q: "Will patients know they are talking to an AI?",

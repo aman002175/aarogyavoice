@@ -15,7 +15,7 @@
 A **SaaS platform** that replaces traditional clinic receptionists with an intelligent voice AI. Patients call a dedicated number, the AI:
 - ✅ Answers instantly (24/7)
 - ✅ Tells real-time appointment status
-- ✅ Books appointments from available slots
+- ✅ Books a token in the live queue
 - ✅ Handles clinic closures and leave automatically
 
 **Perfect for:** Dentists, Dermatologists, Physiotherapists, and Independent Healthcare Practitioners.
@@ -51,21 +51,17 @@ Patient calls → AI Receptionist answers
 ## 📊 System Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    PATIENT FLOW                         │
-├─────────────────────────────────────────────────────────┤
-│                                                         │
-│   [Patient Calls]                                       │
-│        ↓                                                │
-│   [Vapi.ai / Bland.ai Voice AI]                         │
-│        ↓                                                │
-│   [Custom Webhook] → [Node.js/Next.js Backend]          │
-│        ↓              ↓                                  │
-│   [MongoDB]       [Doctor Dashboard]                    │
-│        ↓              ↓                                  │
-│   Appointments    Live Token Display                    │
-│                                                         │
-└─────────────────────────────────────────────────────────┘
+Patient calls clinic number
+     ↓
+Twilio Media Streams  (webhook: POST /twilio/voice → TwiML <Connect><Stream>)
+     ↓  WebSocket, mulaw 8000Hz
+voice-agent (Node.js + Express + ws on Railway/Koyeb)
+     ├─ Deepgram Nova-2 (STT, WebSocket)
+     ├─ Groq Llama-3 (JSON actions, live token context injected per turn)
+     ├─ Deepgram Aura (TTS, mulaw 8000Hz)
+     └─ MongoDB (clinics, patients, appointments, live tokens)
+     ↓
+Socket.io events → Doctor Dashboard / Queue Display (instant UI updates)
 ```
 
 ---
@@ -75,9 +71,9 @@ Patient calls → AI Receptionist answers
 | Layer | Technology |
 |-------|------------|
 | **Frontend** | Next.js 14+, React, Tailwind CSS, WebSocket for real-time updates |
-| **Backend** | Node.js (Express) / Next.js API Routes |
+| **Backend** | Node.js + Express + ws (`voice-agent/` on Railway/Koyeb) + Socket.io |
 | **Database** | MongoDB (Mongoose ODM) |
-| **Voice AI** | Vapi.ai / Bland.ai (with custom webhooks) |
+| **Voice AI** | Twilio Media Streams + Deepgram Nova-2 (STT) + Deepgram Aura (TTS) + Groq Llama-3 |
 | **Auth** | JWT (Doctor) + Admin Secret Key (Super Admin) |
 | **Hosting** | Vercel (Frontend), Node.js Server (Backend) |
 
@@ -93,7 +89,7 @@ Patient calls → AI Receptionist answers
   clinic_name: String,
   email: String,
   password_hash: String,
-  assigned_phone_number: String,    // Null until admin assigns
+  twilio_number: String,            // E.164 — the multi-tenant key (resolved from Twilio `To`)
   number_status: "PENDING" | "ACTIVE" | "SUSPENDED",
   plan_status: "TRIAL" | "ACTIVE" | "EXPIRED",
   plan_expires_at: Date,
@@ -102,8 +98,9 @@ Patient calls → AI Receptionist answers
     end_time: "17:00",
     slot_duration: 15       // minutes
   },
-  current_token: Number,     // Currently serving patient
-  is_open: Boolean,          // Clinic status
+  is_on_holiday: Boolean,
+  current_running_token: Number,   // token being served now
+  last_assigned_token: Number      // last token handed out (atomic $inc)
   created_at: Date
 }
 ```
@@ -116,7 +113,7 @@ Patient calls → AI Receptionist answers
   patient_name: String,
   patient_phone: String,
   token_number: Number,      // Sequential: 1, 2, 3...
-  appointment_time: Date,
+  day: "today" | "tomorrow",       // dynamic token queue — no fixed time slots
   status: "WAITING" | "COMPLETED" | "CANCELLED",
   notes: String,
   created_at: Date
@@ -135,7 +132,7 @@ Patient calls → AI Receptionist answers
 - [ ] Phone number assignment flow
 
 ### ⏭️ Phase 2: AI Voice Integration
-- [ ] Vapi.ai webhook integration
+- [ ] Twilio Media Streams + Deepgram + Groq pipeline (boilerplate in `voice-agent/`)
 - [ ] Voice bot script & conversation flow
 - [ ] Real-time appointment creation via voice
 - [ ] Twilio SMS notifications
@@ -158,7 +155,10 @@ Patient calls → AI Receptionist answers
 | `/api/doctor/next-patient` | POST | Increment current token |
 | `/api/doctor/toggle-status` | POST | Open/Close clinic |
 | `/api/admin/assign-number` | POST | Assign phone to clinic |
-| `/api/vapi/webhook` | POST | AI voice interaction (read/write) |
+| `/twilio/voice` | POST | Twilio webhook — TwiML `<Connect><Stream>` |
+| `/media-stream` | WS | Twilio Media Streams (STT → LLM → TTS loop) |
+| `/api/clinic/next-token` | POST | Advance the live token queue |
+| `/socket.io/` | WS | Real-time queue events to the dashboard |
 | `/api/appointments/today` | GET | Today's appointments |
 
 ---
@@ -215,13 +215,17 @@ MONGO_URI=mongodb+srv://username:password@cluster.mongodb.net/dbname
 JWT_SECRET=your_super_secret_jwt_key_here
 ADMIN_SECRET_KEY=super_admin_password_12345
 
-# Voice AI
-VAPI_API_KEY=your_vapi_secret_key
-VAPI_ASSISTANT_ID=your_assistant_id
+# Voice pipeline (voice-agent/)
+TWILIO_AUTH_TOKEN=your_twilio_auth_token
+DEEPGRAM_API_KEY=your_deepgram_key
+GROQ_API_KEY=your_groq_key
 
 # App
 NODE_ENV=development
 NEXTAUTH_SECRET=your_nextauth_secret
+
+# Frontend → voice-agent (set on Vercel / preview env)
+NEXT_PUBLIC_BACKEND_URL=https://your-voice-agent.up.railway.app
 ```
 
 ---
@@ -231,8 +235,9 @@ NEXTAUTH_SECRET=your_nextauth_secret
 ### Current architecture (self-hosted voice pipeline)
 
 - **[DOCS_AUDIT_AND_CHALLENGES.md](./docs/DOCS_AUDIT_AND_CHALLENGES.md)** — ⚠️ **Read first.** Review of every doc: cost errors, security bugs, and contradictions
-- **[ARCHITECTURE.md](./docs/ARCHITECTURE.md)** — Twilio Media Streams → Pipecat → Deepgram → Groq → Kokoro
-- **[DEPLOYMENT_GUIDE.md](./docs/DEPLOYMENT_GUIDE.md)** — Deploying the Pipecat voice service on Railway
+- **[ARCHITECTURE.md](./docs/ARCHITECTURE.md)** — Original Pipecat-era design *(superseded by `voice-agent/`)*
+- **[DEPLOYMENT_GUIDE.md](./docs/DEPLOYMENT_GUIDE.md)** — Railway deploy (Pipecat-era; use `voice-agent/README.md`)
+- **[voice-agent/README.md](./voice-agent/README.md)** — ⭐ Live setup guide for the Node.js voice orchestrator
 - **[PRICING_AND_BUSINESS.md](./docs/PRICING_AND_BUSINESS.md)** — Pricing strategy and 30-day plan *(cost inputs unverified — see audit)*
 - **[DATABASE_SCHEMA.md](./docs/DATABASE_SCHEMA.md)** — MongoDB collections for clinics, patients, appointments
 - **[VOICE_AGENT_PROMPT.md](./docs/VOICE_AGENT_PROMPT.md)** — System prompt and tool definitions
@@ -242,8 +247,11 @@ NEXTAUTH_SECRET=your_nextauth_secret
 - **[LAUNCH_PLAN.md](./docs/LAUNCH_PLAN.md)** — Go-to-market plan for the first 10 clinics
 - **[PRICING_MODEL.md](./docs/PRICING_MODEL.md)** — Prior Vapi-based cost analysis *(superseded)*
 
-> ⚠️ **Status:** No voice pipeline code exists yet. `voice-agent/` has not been created.
-> The docs above describe an intended design, not a working system.
+### Archived (Vapi.ai era)
+
+- **[docs/archive/VAPI_SETUP.md](./docs/archive/VAPI_SETUP.md)** and **[docs/archive/ACCOUNT_SETUP_GUIDE.md](./docs/archive/ACCOUNT_SETUP_GUIDE.md)** — dropped with the Vapi stack; kept for reference only
+
+> ⚠️ **Status:** `voice-agent/` holds the Node.js orchestrator **boilerplate**, and the Next.js dashboard auto-falls back to demo data until `NEXT_PUBLIC_BACKEND_URL` points at a deployed voice-agent. No keys are wired and no calls have flowed yet.
 
 ---
 
@@ -272,7 +280,7 @@ This project is licensed under the MIT License — see [LICENSE](./LICENSE) file
 
 ## 🙏 Acknowledgments
 
-- Built with Next.js, MongoDB, and Vapi.ai
+- Built with Next.js, Node.js, Twilio, Deepgram, Groq, and MongoDB
 - Inspired by modern clinic management systems
 - Made for Indian healthcare practitioners
 
