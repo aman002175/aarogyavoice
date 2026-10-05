@@ -29,6 +29,7 @@ the server's atomic counter is the only source of truth.
 cd voice-agent
 cp env.example .env        # fill in the keys (never commit .env)
 npm install
+npm test                   # pure-logic unit tests — no API keys needed
 npm run seed -- +911140001234 "Clinic Name"   # create the clinic row your Twilio number resolves to
 npm run dev                # node --watch server.js
 ```
@@ -64,6 +65,7 @@ Required env vars: `MONGO_URI`, `DEEPGRAM_API_KEY`, `GROQ_API_KEY`,
 | `/twilio/voice` | POST | Twilio webhook → TwiML `<Connect><Stream>` |
 | `/media-stream` | WS | Twilio Media Streams audio loop |
 | `/api/clinic/next-token` | POST `{clinicId}` | "Next Patient" — atomic advance + `token:advanced` emit |
+| `/api/clinic/cancel-token` | POST `{clinicId, tokenNumber}` | Cancel a waiting token + `token:cancelled` emit |
 | `/api/clinic/:id/state` | GET | Initial dashboard hydration |
 | `/socket.io/` | WS | Rooms `clinic:<id>`; events `token:booked`, `token:advanced` |
 
@@ -71,6 +73,8 @@ Socket.io client (Next.js): `io(BACKEND_URL, { auth: { clinicId } })`, then
 listen for `token:booked` / `token:advanced`.
 
 ## Deploy (Railway / Koyeb)
+
+> Full step-by-step + the complete env-var/secret table: **[docs/DEPLOYMENT_ENV.md](../docs/DEPLOYMENT_ENV.md)**
 
 - Set the service **root directory to `voice-agent/`** (it has its own
   `package.json`); start command `node server.js`, or `npm start`.
@@ -92,8 +96,8 @@ listen for `token:booked` / `token:advanced`.
   anything public.
 - **Barge-in** (patient interrupting TTS) and per-turn mark tracking are not
   implemented yet.
-- **Daily token reset:** `last_assigned_token` / `current_running_token` need a
-  day-rollover job (reset to 0 at clinic open time).
+- **Daily token reset:** done — counters reset automatically on the first
+  touch of a new IST day (`ensureFreshDay` in server.js).
 - **Billing reality:** Twilio Media Streams bills $0.0044/min on top of the
   inbound per-minute rate — it applies to this architecture exactly as it did
   to the Vapi plan (see docs/DOCS_AUDIT_AND_CHALLENGES.md).

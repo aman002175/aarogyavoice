@@ -24,6 +24,7 @@ const ClinicSchema = new Schema({
   current_running_token: { type: Number, default: 0, min: 0 }, // token being served now
   last_assigned_token: { type: Number, default: 0, min: 0 },   // last token handed out; ONLY change via atomic $inc
   last_served_token: { type: Number, default: 0, min: 0 },
+  last_reset_date: { type: Date }, // last IST day the counters were reset for
   avg_minutes_per_token: { type: Number, default: 15 },
   token_history: [{ token: Number, served_at: Date }],
 

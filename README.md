@@ -235,6 +235,7 @@ NEXT_PUBLIC_BACKEND_URL=https://your-voice-agent.up.railway.app
 ### Current architecture (self-hosted voice pipeline)
 
 - **[DOCS_AUDIT_AND_CHALLENGES.md](./docs/DOCS_AUDIT_AND_CHALLENGES.md)** — ⚠️ **Read first.** Review of every doc: cost errors, security bugs, and contradictions
+- **[DEPLOYMENT_ENV.md](./docs/DEPLOYMENT_ENV.md)** — ⭐ Deploy guide: Vercel + Railway steps, and exactly which env vars/secrets go in frontend vs backend
 - **[ARCHITECTURE.md](./docs/ARCHITECTURE.md)** — Original Pipecat-era design *(superseded by `voice-agent/`)*
 - **[DEPLOYMENT_GUIDE.md](./docs/DEPLOYMENT_GUIDE.md)** — Railway deploy (Pipecat-era; use `voice-agent/README.md`)
 - **[voice-agent/README.md](./voice-agent/README.md)** — ⭐ Live setup guide for the Node.js voice orchestrator

@@ -90,3 +90,75 @@ export async function advanceQueue(
     return null;
   }
 }
+
+/** Emitted by voice-agent when a waiting token is cancelled from the dashboard. */
+export interface TokenCancelledEvent {
+  clinicId: string;
+  tokenNumber: number;
+  status: "CANCELLED";
+}
+
+/** Shape of GET /api/clinic/:id/state (voice-agent). */
+export interface ClinicStateResponse {
+  clinic: {
+    id: string;
+    clinicName: string;
+    doctorName: string;
+    isOnHoliday: boolean;
+    currentRunningToken: number;
+    lastAssignedToken: number;
+    avgMinutesPerToken: number;
+  };
+  waiting: Array<{
+    _id: string;
+    token_number: number;
+    day: "today" | "tomorrow";
+    status: string;
+    notes?: string;
+    patient_id?: { name?: string } | null;
+  }>;
+}
+
+/** Initial dashboard hydration before the Socket.io subscription kicks in. */
+export async function fetchClinicState(
+  clinicId: string,
+): Promise<ClinicStateResponse | null> {
+  if (!isBackendConfigured) return null;
+  try {
+    const res = await fetch(`${backendUrl}/api/clinic/${clinicId}/state`);
+    if (!res.ok) {
+      console.error(`clinic state failed: ${res.status}`);
+      return null;
+    }
+    return (await res.json()) as ClinicStateResponse;
+  } catch (err) {
+    console.error("clinic state request failed:", err);
+    return null;
+  }
+}
+
+/** Cancel a waiting token. The UI updates via the `token:cancelled` event. */
+export async function cancelQueueToken(
+  clinicId: string,
+  tokenNumber: number,
+): Promise<boolean> {
+  if (!isBackendConfigured) return false;
+  try {
+    const res = await fetch(`${backendUrl}/api/clinic/cancel-token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ clinicId, tokenNumber }),
+    });
+    if (!res.ok) {
+      console.error(
+        `cancel-token failed: ${res.status}`,
+        await res.text().catch(() => ""),
+      );
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error("cancel-token request failed:", err);
+    return false;
+  }
+}

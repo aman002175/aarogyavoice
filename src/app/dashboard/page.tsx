@@ -28,11 +28,14 @@ import {
 } from "@/lib/mock-data";
 import {
   advanceQueue,
+  cancelQueueToken,
   demoClinicId,
+  fetchClinicState,
   getQueueSocket,
   isBackendConfigured,
   type TokenAdvancedEvent,
   type TokenBookedEvent,
+  type TokenCancelledEvent,
 } from "@/lib/backend";
 
 const statusStyles: Record<AppointmentStatus, string> = {
@@ -152,11 +155,45 @@ export default function DashboardPage() {
         ),
       );
     };
+    const onCancelled = (p: TokenCancelledEvent) => {
+      setAppointments((prev) =>
+        prev.map((a) =>
+          a.tokenNumber === p.tokenNumber && a.status === "WAITING"
+            ? { ...a, status: "CANCELLED" as const }
+            : a,
+        ),
+      );
+    };
     socket.on("token:booked", onBooked);
     socket.on("token:advanced", onAdvanced);
+    socket.on("token:cancelled", onCancelled);
     return () => {
       socket.off("token:booked", onBooked);
       socket.off("token:advanced", onAdvanced);
+      socket.off("token:cancelled", onCancelled);
+    };
+  }, []);
+
+  // Live mode: hydrate the real queue once; Socket.io keeps it fresh after.
+  useEffect(() => {
+    if (!isBackendConfigured) return;
+    let stale = false;
+    void fetchClinicState(demoClinicId).then((state) => {
+      if (!state || stale) return;
+      setAppointments(
+        state.waiting.map((a) => ({
+          id: a._id,
+          patientName: a.patient_id?.name || "Patient",
+          tokenNumber: a.token_number,
+          day: a.day,
+          reason: a.notes || "Consultation",
+          status: "WAITING" as const,
+        })),
+      );
+      setIsOpen(!state.clinic.isOnHoliday);
+    });
+    return () => {
+      stale = true;
     };
   }, []);
 
@@ -210,7 +247,15 @@ export default function DashboardPage() {
     );
   }
 
-  function cancelPatient(id: string) {
+  async function cancelPatient(id: string) {
+    const appt = appointments.find((a) => a.id === id);
+    if (!appt) return;
+    if (isBackendConfigured) {
+      // Server marks it CANCELLED and broadcasts `token:cancelled`; the
+      // socket handler above updates this list.
+      await cancelQueueToken(demoClinicId, appt.tokenNumber);
+      return;
+    }
     setAppointments((prev) =>
       prev.map((a) => (a.id === id ? { ...a, status: "CANCELLED" as const } : a)),
     );
@@ -436,7 +481,7 @@ export default function DashboardPage() {
                     </span>
                     <button
                       type="button"
-                      onClick={() => cancelPatient(appt.id)}
+                      onClick={() => void cancelPatient(appt.id)}
                       className="grid size-8 place-items-center rounded-lg text-ink-400 transition-colors hover:bg-ink-100 hover:text-ink-700"
                       aria-label={`Cancel ${appt.patientName}`}
                     >

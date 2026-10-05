@@ -8,10 +8,12 @@ import { Waveform } from "@/components/waveform";
 import { demoClinic, queueBoard, servingToken } from "@/lib/mock-data";
 import {
   demoClinicId,
+  fetchClinicState,
   getQueueSocket,
   isBackendConfigured,
   type TokenAdvancedEvent,
   type TokenBookedEvent,
+  type TokenCancelledEvent,
 } from "@/lib/backend";
 
 /**
@@ -50,11 +52,39 @@ export default function QueueDisplayPage() {
           })),
       );
     };
+    const onCancelled = (p: TokenCancelledEvent) => {
+      setBoard((prev) => prev.filter((r) => r.token !== p.tokenNumber));
+    };
     socket.on("token:booked", onBooked);
     socket.on("token:advanced", onAdvanced);
+    socket.on("token:cancelled", onCancelled);
     return () => {
       socket.off("token:booked", onBooked);
       socket.off("token:advanced", onAdvanced);
+      socket.off("token:cancelled", onCancelled);
+    };
+  }, []);
+
+  // Live mode: hydrate the real board once; Socket.io keeps it fresh after.
+  useEffect(() => {
+    if (!isBackendConfigured) return;
+    let stale = false;
+    void fetchClinicState(demoClinicId).then((state) => {
+      if (!state || stale) return;
+      const current = state.clinic.currentRunningToken;
+      const per = state.clinic.avgMinutesPerToken || 15;
+      setServing(current);
+      setBoard(
+        state.waiting
+          .filter((a) => a.token_number > current)
+          .map((a, i) => ({
+            token: a.token_number,
+            wait: `${(i + 1) * per} min`,
+          })),
+      );
+    });
+    return () => {
+      stale = true;
     };
   }, []);
 

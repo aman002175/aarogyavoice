@@ -1,6 +1,6 @@
 # 🚀 Deployment Guide: Pipecat Voice Pipeline on Railway
 
-> ⚠️ **SUPERSEDED (Oct 2026).** This guide targets the Python/Pipecat pipeline, is missing the Twilio TwiML step entirely, and uses a `/call` path that was never implemented. The voice service is now the Node.js **`voice-agent/`** (Twilio Media Streams + Deepgram + Groq on Railway/Koyeb). Follow **[voice-agent/README.md](../voice-agent/README.md)** instead.
+> ⚠️ **SUPERSEDED (Oct 2026).** This guide targets the Python/Pipecat pipeline, is missing the Twilio TwiML step entirely, and uses a `/call` path that was never implemented. The voice service is now the Node.js **`voice-agent/`** (Twilio Media Streams + Deepgram + Groq on Railway/Koyeb). Follow **[DEPLOYMENT_ENV.md](./DEPLOYMENT_ENV.md)** (deploy steps + env vars) or **[voice-agent/README.md](../voice-agent/README.md)** instead.
 
 ## 1. Prerequisites
 - GitHub Account

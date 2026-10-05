@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  typecheck-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install frontend deps
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck Next.js app
+        run: bun tsc -b --noEmit
+
+      - name: Install voice-agent deps
+        working-directory: voice-agent
+        run: bun install --frozen-lockfile
+
+      - name: Voice-agent unit tests
+        working-directory: voice-agent
+        run: node --test test/unit.test.js

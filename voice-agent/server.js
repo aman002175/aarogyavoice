@@ -46,12 +46,14 @@ const REQUIRED_ENV = [
   "PUBLIC_BASE_URL",
   "PUBLIC_WS_URL",
 ];
-const missing = REQUIRED_ENV.filter((key) => !process.env[key]);
-if (missing.length > 0) {
-  console.error(
-    `[voice-agent] Missing required env vars: ${missing.join(", ")} — see voice-agent/env.example`
-  );
-  process.exit(1);
+function assertEnv() {
+  const missing = REQUIRED_ENV.filter((key) => !process.env[key]);
+  if (missing.length > 0) {
+    console.error(
+      `[voice-agent] Missing required env vars: ${missing.join(", ")} — see voice-agent/env.example`
+    );
+    process.exit(1);
+  }
 }
 
 const PORT = process.env.PORT || 8080;
@@ -76,6 +78,13 @@ function normalizePhone(raw) {
   return trimmed.startsWith("+") ? "+" + trimmed.slice(1).replace(/\D/g, "") : trimmed.replace(/\D/g, "");
 }
 
+/** Canonical payload Twilio signs: URL + params sorted by key, concatenated. */
+function twilioSignaturePayload(url, params) {
+  return Object.keys(params || {})
+    .sort()
+    .reduce((acc, key) => acc + key + params[key], url);
+}
+
 /**
  * Validate Twilio's X-Twilio-Signature header (HMAC-SHA1 over the full URL +
  * alphabetically-sorted POST params). The old Vapi HMAC snippet in the docs
@@ -90,9 +99,7 @@ function isTwilioRequestValid(req) {
   const authToken = process.env.TWILIO_AUTH_TOKEN;
   if (!signature || !authToken) return false;
   const url = `${process.env.PUBLIC_BASE_URL.replace(/\/+$/, "")}/twilio/voice`;
-  const data = Object.keys(req.body || {})
-    .sort()
-    .reduce((acc, key) => acc + key + req.body[key], url);
+  const data = twilioSignaturePayload(url, req.body || {});
   const expected = crypto
     .createHmac("sha1", authToken)
     .update(Buffer.from(data, "utf8"))
@@ -122,6 +129,40 @@ function serializeClinic(c) {
 function estimateWaitMinutes(clinic, forToken) {
   const per = clinic.avg_minutes_per_token || 15;
   return Math.max(0, (forToken - (clinic.current_running_token || 0)) * per);
+}
+
+/** IST calendar date key ("YYYY-MM-DD"). India has no DST — fixed +05:30. */
+function istDateKey(date) {
+  return new Date(new Date(date).getTime() + 5.5 * 3600 * 1000)
+    .toISOString()
+    .slice(0, 10);
+}
+
+/**
+ * Token counters are per-day. On the first touch of a new IST day, reset them
+ * so yesterday's queue never leaks into today's. Idempotent; safe to call
+ * from the webhook and the dashboard endpoints.
+ */
+async function ensureFreshDay(clinic) {
+  const today = istDateKey(new Date());
+  if (clinic.last_reset_date && istDateKey(clinic.last_reset_date) === today) {
+    return clinic;
+  }
+  const updated = await Clinic.findOneAndUpdate(
+    { _id: clinic._id },
+    {
+      $set: {
+        current_running_token: 0,
+        last_assigned_token: 0,
+        last_served_token: 0,
+        token_history: [],
+        last_reset_date: new Date(),
+      },
+    },
+    { new: true }
+  );
+  log.info(`clinic ${clinic._id}: new day (${today}) — token counters reset`);
+  return updated || clinic;
 }
 
 /**
@@ -157,6 +198,21 @@ RULES:
 6. Token number TUM assign nahi karti — booking ke baad server final token bolega. Isliye kisi naye token number ka specific claim apni reply me mat karo.`;
 }
 
+/** Tolerant JSON parse: raw object, fenced/mixed text, or null. */
+function parseLLMJson(raw) {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    const match = String(raw).match(/\{[\s\S]*\}/);
+    if (!match) return null;
+    try {
+      return JSON.parse(match[0]);
+    } catch {
+      return null;
+    }
+  }
+}
+
 /** Groq chat completion, forced into JSON mode. Returns a normalized action object. */
 async function callGroq(systemPrompt, history, userText) {
   const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
@@ -183,17 +239,7 @@ async function callGroq(systemPrompt, history, userText) {
   }
   const data = await res.json();
   const raw = data.choices?.[0]?.message?.content || "";
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    const match = raw.match(/\{[\s\S]*\}/);
-    try {
-      parsed = match ? JSON.parse(match[0]) : null;
-    } catch {
-      parsed = null;
-    }
-  }
+  const parsed = parseLLMJson(raw);
   if (!parsed || typeof parsed.reply !== "string") {
     // JSON mode can still fail on edge inputs; degrade gracefully to raw text.
     return { reply: raw.slice(0, 300) || "Ji, bataiye.", action: "none" };
@@ -328,11 +374,12 @@ app.post("/twilio/voice", async (req, res) => {
     const from = normalizePhone(req.body.From);
     const callSid = req.body.CallSid || "";
 
-    const clinic = await Clinic.findOne({ twilio_number: to, is_active: true });
+    let clinic = await Clinic.findOne({ twilio_number: to, is_active: true });
     if (!clinic) {
       log.info(`call ${callSid}: no clinic owns ${to} — rejecting`);
       return res.type("text/xml").send(sayTwiml("Sorry, is number par abhi koi clinic active nahi hai."));
     }
+    clinic = await ensureFreshDay(clinic);
 
     log.info(`call ${callSid}: resolved clinic ${clinic._id} (${clinic.clinic_name})`);
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -364,8 +411,9 @@ app.post("/api/clinic/next-token", async (req, res) => {
     // TODO(auth): verify the dashboard JWT and that this user belongs to
     // clinicId before mutating anything.
 
-    const clinic = await Clinic.findById(clinicId);
+    let clinic = await Clinic.findById(clinicId);
     if (!clinic) return res.status(404).json({ error: "Clinic not found" });
+    clinic = await ensureFreshDay(clinic);
     if (clinic.current_running_token >= clinic.last_assigned_token) {
       return res.status(409).json({ error: "Queue already caught up — no waiting tokens", clinic: serializeClinic(clinic) });
     }
@@ -411,6 +459,34 @@ app.post("/api/clinic/next-token", async (req, res) => {
   }
 });
 
+/**
+ * Dashboard "Cancel" on a waiting patient. Marks the appointment CANCELLED
+ * and tells every connected dashboard; token numbers are never reused.
+ */
+app.post("/api/clinic/cancel-token", async (req, res) => {
+  try {
+    const { clinicId, tokenNumber } = req.body || {};
+    if (!clinicId || !/^[a-f\d]{24}$/i.test(clinicId) || !Number.isInteger(tokenNumber)) {
+      return res.status(400).json({ error: "clinicId (24-hex) and integer tokenNumber are required" });
+    }
+    // TODO(auth): verify the dashboard JWT and clinic membership.
+
+    const updated = await Appointment.findOneAndUpdate(
+      { clinic_id: clinicId, token_number: tokenNumber, day: "today", status: "WAITING" },
+      { $set: { status: "CANCELLED" } },
+      { new: true }
+    );
+    if (!updated) return res.status(404).json({ error: "No waiting appointment with that token" });
+
+    const payload = { clinicId, tokenNumber, status: "CANCELLED" };
+    io.to(`clinic:${clinicId}`).emit("token:cancelled", payload);
+    return res.json(payload);
+  } catch (err) {
+    log.error("/api/clinic/cancel-token failed:", err);
+    return res.status(500).json({ error: "Internal error" });
+  }
+});
+
 /** Initial dashboard hydration before the Socket.io subscription kicks in. */
 app.get("/api/clinic/:id/state", async (req, res) => {
   try {
@@ -451,6 +527,7 @@ io.on("connection", (socket) => {
 // Events emitted to rooms (documented contract for the frontend):
 //   "token:booked"   -> { clinicId, tokenNumber, patientName, day, waitMinutes, lastAssignedToken }
 //   "token:advanced" -> { clinicId, servedToken, currentRunningToken, lastAssignedToken }
+//   "token:cancelled" -> { clinicId, tokenNumber, status: "CANCELLED" }
 
 // ---------------------------------------------------------------------------
 // WebSocket — Twilio Media Streams
@@ -750,20 +827,23 @@ function closeSession(session) {
 // Boot
 // ---------------------------------------------------------------------------
 
-mongoose
-  .connect(process.env.MONGO_URI, { serverSelectionTimeoutMS: 10000 }) // fail fast on a bad URI instead of retrying for 30s
-  .then(() => {
-    log.info("MongoDB connected");
-    server.listen(PORT, () => {
-      log.info(`voice-agent listening on :${PORT}`);
-      log.info(`  webhook  POST ${process.env.PUBLIC_BASE_URL}/twilio/voice`);
-      log.info(`  stream   ${process.env.PUBLIC_WS_URL}`);
+if (require.main === module) {
+  assertEnv();
+  mongoose
+    .connect(process.env.MONGO_URI, { serverSelectionTimeoutMS: 10000 }) // fail fast on a bad URI instead of retrying for 30s
+    .then(() => {
+      log.info("MongoDB connected");
+      server.listen(PORT, () => {
+        log.info(`voice-agent listening on :${PORT}`);
+        log.info(`  webhook  POST ${process.env.PUBLIC_BASE_URL}/twilio/voice`);
+        log.info(`  stream   ${process.env.PUBLIC_WS_URL}`);
+      });
+    })
+    .catch((err) => {
+      log.error("MongoDB connection failed:", err.message);
+      process.exit(1);
     });
-  })
-  .catch((err) => {
-    log.error("MongoDB connection failed:", err.message);
-    process.exit(1);
-  });
+}
 
 process.on("unhandledRejection", (reason) => log.error("Unhandled rejection:", reason));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
@@ -774,3 +854,16 @@ function shutdown(signal) {
   server.close(() => mongoose.connection.close(false).then(() => process.exit(0)));
   setTimeout(() => process.exit(0), 8000).unref();
 }
+
+// Exported for unit tests (test/unit.test.js) — pure logic only, no side effects.
+module.exports = {
+  normalizePhone,
+  estimateWaitMinutes,
+  buildSystemPrompt,
+  parseLLMJson,
+  twilioSignaturePayload,
+  bookingConfirmationText,
+  splitSentences,
+  istDateKey,
+  ensureFreshDay,
+};
