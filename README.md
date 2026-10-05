@@ -228,10 +228,22 @@ NEXTAUTH_SECRET=your_nextauth_secret
 
 ## 📚 Documentation
 
-- **[ARCHITECTURE.md](./docs/ARCHITECTURE.md)** — Detailed system design & workflow
-- **[GETTING_STARTED.md](./docs/GETTING_STARTED.md)** — Step-by-step setup guide
-- **[API_DOCS.md](./docs/API_DOCS.md)** — Complete API reference
-- **[DATABASE.md](./docs/DATABASE.md)** — MongoDB schema details
+### Current architecture (self-hosted voice pipeline)
+
+- **[DOCS_AUDIT_AND_CHALLENGES.md](./docs/DOCS_AUDIT_AND_CHALLENGES.md)** — ⚠️ **Read first.** Review of every doc: cost errors, security bugs, and contradictions
+- **[ARCHITECTURE.md](./docs/ARCHITECTURE.md)** — Twilio Media Streams → Pipecat → Deepgram → Groq → Kokoro
+- **[DEPLOYMENT_GUIDE.md](./docs/DEPLOYMENT_GUIDE.md)** — Deploying the Pipecat voice service on Railway
+- **[PRICING_AND_BUSINESS.md](./docs/PRICING_AND_BUSINESS.md)** — Pricing strategy and 30-day plan *(cost inputs unverified — see audit)*
+- **[DATABASE_SCHEMA.md](./docs/DATABASE_SCHEMA.md)** — MongoDB collections for clinics, patients, appointments
+- **[VOICE_AGENT_PROMPT.md](./docs/VOICE_AGENT_PROMPT.md)** — System prompt and tool definitions
+
+### Planning
+
+- **[LAUNCH_PLAN.md](./docs/LAUNCH_PLAN.md)** — Go-to-market plan for the first 10 clinics
+- **[PRICING_MODEL.md](./docs/PRICING_MODEL.md)** — Prior Vapi-based cost analysis *(superseded)*
+
+> ⚠️ **Status:** No voice pipeline code exists yet. `voice-agent/` has not been created.
+> The docs above describe an intended design, not a working system.
 
 ---
 
