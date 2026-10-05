@@ -15,7 +15,12 @@ const {
   bookingConfirmationText,
   splitSentences,
   istDateKey,
+  parseCookies,
+  verifyScryptHash,
+  signAdminToken,
+  verifyAdminToken,
 } = require("../server.js");
+const crypto = require("crypto");
 
 test("normalizePhone strips tel:, spaces and separators", () => {
   assert.equal(normalizePhone("tel:+91 98765-43210"), "+919876543210");
@@ -120,4 +125,39 @@ test("istDateKey uses fixed +05:30 offset (no DST)", () => {
   assert.equal(istDateKey(new Date("2026-10-04T20:00:00Z")), "2026-10-05"); // 01:30 IST
   assert.equal(istDateKey(new Date("2026-10-05T18:00:00Z")), "2026-10-05"); // 23:30 IST
   assert.equal(istDateKey(new Date("2026-10-05T18:31:00Z")), "2026-10-06"); // 00:01 IST
+});
+
+test("parseCookies handles multiple pairs and = inside values", () => {
+  assert.deepEqual(parseCookies("a=1; b=two=parts; c="), { a: "1", b: "two=parts", c: "" });
+  assert.deepEqual(parseCookies(""), {});
+});
+
+test("scrypt hash verifies the right password and rejects wrong/empty", () => {
+  const salt = crypto.randomBytes(16);
+  const hash = crypto.scryptSync("correct horse battery", salt, 64, { N: 16384, r: 8, p: 1 });
+  const stored = `scrypt$16384$8$1$${salt.toString("hex")}$${hash.toString("hex")}`;
+  assert.equal(verifyScryptHash("correct horse battery", stored), true);
+  assert.equal(verifyScryptHash("wrong password", stored), false);
+  assert.equal(verifyScryptHash("correct horse battery", "garbage"), false);
+  assert.equal(verifyScryptHash("correct horse battery", ""), false);
+});
+
+test("admin session token: sign -> verify, and tamper/expiry rejection", () => {
+  process.env.ADMIN_SESSION_SECRET = "test-secret-for-unit-tests-only";
+  const token = signAdminToken(60_000);
+  assert.equal(verifyAdminToken(token), true);
+
+  const [payload, sig] = token.split(".");
+  const tamperedSig = Buffer.from("x").toString("base64url");
+  assert.equal(verifyAdminToken(`${payload}.${tamperedSig}`), false);
+  assert.equal(verifyAdminToken(`${payload}`), false);
+  assert.equal(verifyAdminToken(""), false);
+
+  const expired = signAdminToken(-1_000); // already expired
+  assert.equal(verifyAdminToken(expired), false);
+
+  const other = signAdminToken(60_000);
+  process.env.ADMIN_SESSION_SECRET = "a-different-secret";
+  assert.equal(verifyAdminToken(other), false); // wrong signing secret
+  process.env.ADMIN_SESSION_SECRET = "test-secret-for-unit-tests-only";
 });

@@ -355,7 +355,20 @@ function bookingConfirmationText(r) {
 const app = express();
 app.use(express.urlencoded({ extended: false })); // Twilio webhooks POST form-encoded
 app.use(express.json());
-app.use(cors({ origin: process.env.FRONTEND_URL || "*", methods: ["GET", "POST"] }));
+// CORS is exact-origin + credentials — never "*" — so the admin session
+// cookie (SameSite=None) can only be sent by the known frontend origin.
+const corsOrigin = (process.env.FRONTEND_URL || "").replace(/\/+$/, "") || false;
+app.use(cors({ origin: corsOrigin, credentials: true, methods: ["GET", "POST"] }));
+
+// Baseline hardening headers on every response.
+app.use((_req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  next();
+});
 
 app.get("/healthz", (_req, res) => res.json({ ok: true, activeCalls: activeSessions.size }));
 
@@ -510,7 +523,7 @@ app.get("/api/clinic/:id/state", async (req, res) => {
 const server = http.createServer(app);
 const io = new SocketServer(server, {
   path: "/socket.io",
-  cors: { origin: process.env.FRONTEND_URL || "*", methods: ["GET", "POST"] },
+  cors: { origin: corsOrigin, methods: ["GET", "POST"] },
 });
 
 io.on("connection", (socket) => {
@@ -824,6 +837,221 @@ function closeSession(session) {
 }
 
 // ---------------------------------------------------------------------------
+// Super-admin auth (hidden /aarogya-super-admin console)
+// ---------------------------------------------------------------------------
+// Security model:
+//   - Credentials live ONLY in backend env (SUPER_ADMIN_ID + scrypt password hash).
+//   - ID and password are compared length-hiding (sha256 + timingSafeEqual) so
+//     response timing never reveals which part was wrong.
+//   - Per-IP brute-force guard: 5 failures / 15 min -> 15-minute lockout.
+//   - Session = HMAC-SHA256-signed token in an HttpOnly + Secure + SameSite=None
+//     cookie (cross-site Vercel -> Railway needs None; CSRF is covered by
+//     requiring a custom header that cross-site pages cannot forge, since CORS
+//     only approves the known frontend origin).
+//   - Generic error strings everywhere; failures are audit-logged with IP.
+
+const ADMIN_COOKIE = "aarogya_admin_session";
+const ADMIN_TTL_MS = 2 * 60 * 60 * 1000;
+const MAX_LOGIN_ATTEMPTS = 5;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_LOCKOUT_MS = 15 * 60 * 1000;
+const loginAttempts = new Map(); // ip -> { count, firstAt, lockedUntil }
+
+function adminAuthConfigured() {
+  return Boolean(
+    process.env.SUPER_ADMIN_ID &&
+      process.env.ADMIN_SESSION_SECRET &&
+      (process.env.SUPER_ADMIN_PASSWORD_HASH || process.env.SUPER_ADMIN_PASSWORD)
+  );
+}
+
+function parseCookies(header) {
+  const out = {};
+  for (const part of String(header || "").split(";")) {
+    const idx = part.indexOf("=");
+    if (idx === -1) continue;
+    out[part.slice(0, idx).trim()] = part.slice(idx + 1).trim();
+  }
+  return out;
+}
+
+function sha256(input) {
+  return crypto.createHash("sha256").update(String(input)).digest();
+}
+
+/** Length-hiding constant-time string compare (hash both sides first). */
+function safeEqualStr(a, b) {
+  return crypto.timingSafeEqual(sha256(a), sha256(b));
+}
+
+/** Verify `scrypt$N$r$p$saltHex$hashHex` (generate with: npm run hash-password). */
+function verifyScryptHash(password, stored) {
+  const parts = String(stored || "").split("$");
+  if (parts.length !== 6 || parts[0] !== "scrypt") return false;
+  const [, nStr, rStr, pStr, saltHex, hashHex] = parts;
+  const salt = Buffer.from(saltHex, "hex");
+  const expected = Buffer.from(hashHex, "hex");
+  if (salt.length === 0 || expected.length === 0) return false;
+  const actual = crypto.scryptSync(String(password), salt, expected.length, {
+    N: Number(nStr),
+    r: Number(rStr),
+    p: Number(pStr),
+  });
+  return crypto.timingSafeEqual(actual, expected);
+}
+
+function verifyAdminPassword(password) {
+  if (process.env.SUPER_ADMIN_PASSWORD_HASH) {
+    return verifyScryptHash(password, process.env.SUPER_ADMIN_PASSWORD_HASH);
+  }
+  if (process.env.SUPER_ADMIN_PASSWORD) {
+    log.error("SUPER_ADMIN_PASSWORD is plaintext — generate SUPER_ADMIN_PASSWORD_HASH with `npm run hash-password` instead");
+    return safeEqualStr(password, process.env.SUPER_ADMIN_PASSWORD);
+  }
+  return false;
+}
+
+function signAdminToken(ttlMs = ADMIN_TTL_MS) {
+  const payload = Buffer.from(
+    JSON.stringify({ role: "super_admin", iat: Date.now(), exp: Date.now() + ttlMs })
+  ).toString("base64url");
+  const sig = crypto
+    .createHmac("sha256", process.env.ADMIN_SESSION_SECRET || "")
+    .update(payload)
+    .digest("base64url");
+  return `${payload}.${sig}`;
+}
+
+function verifyAdminToken(token) {
+  if (!token) return false;
+  const [payload, sig] = String(token).split(".");
+  if (!payload || !sig) return false;
+  const expected = crypto
+    .createHmac("sha256", process.env.ADMIN_SESSION_SECRET || "")
+    .update(payload)
+    .digest("base64url");
+  const a = Buffer.from(sig);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
+  try {
+    const data = JSON.parse(Buffer.from(payload, "base64url").toString());
+    return data.role === "super_admin" && typeof data.exp === "number" && data.exp > Date.now();
+  } catch {
+    return false;
+  }
+}
+
+function requireSuperAdmin(req) {
+  const cookies = parseCookies(req.headers.cookie);
+  return verifyAdminToken(cookies[ADMIN_COOKIE]);
+}
+
+function registerFailedLogin(ip) {
+  const now = Date.now();
+  const rec = loginAttempts.get(ip) || { count: 0, firstAt: now, lockedUntil: 0 };
+  if (now - rec.firstAt > LOGIN_WINDOW_MS) {
+    rec.count = 0;
+    rec.firstAt = now;
+  }
+  rec.count += 1;
+  if (rec.count >= MAX_LOGIN_ATTEMPTS) rec.lockedUntil = now + LOGIN_LOCKOUT_MS;
+  loginAttempts.set(ip, rec);
+  if (loginAttempts.size > 10000) loginAttempts.clear(); // crude memory cap
+}
+
+function isLoginLocked(ip) {
+  const rec = loginAttempts.get(ip);
+  return Boolean(rec && rec.lockedUntil > Date.now());
+}
+
+function adminGuards(req, res) {
+  if (!adminAuthConfigured()) {
+    res.status(503).json({ error: "Admin auth is not configured" });
+    return false;
+  }
+  // Custom header cross-site pages cannot forge — this is the CSRF defense.
+  if (req.headers["x-aarogya-admin"] !== "1") {
+    res.status(403).json({ error: "Forbidden" });
+    return false;
+  }
+  if (corsOrigin && req.headers.origin && req.headers.origin !== corsOrigin) {
+    res.status(403).json({ error: "Forbidden" });
+    return false;
+  }
+  return true;
+}
+
+app.post("/api/admin/login", async (req, res) => {
+  if (!adminGuards(req, res)) return;
+  const ip =
+    (req.headers["x-forwarded-for"] || "").split(",")[0].trim() ||
+    req.socket?.remoteAddress ||
+    "unknown";
+  if (isLoginLocked(ip)) {
+    return res.status(429).json({ error: "Too many attempts. Try again later." });
+  }
+  const { adminId, password } = req.body || {};
+  const idOk =
+    typeof adminId === "string" &&
+    adminId.length > 0 &&
+    safeEqualStr(adminId, process.env.SUPER_ADMIN_ID);
+  const passOk = typeof password === "string" && password.length > 0 && verifyAdminPassword(password);
+  if (!idOk || !passOk) {
+    registerFailedLogin(ip);
+    await new Promise((r) => setTimeout(r, 400)); // slow online guessing
+    log.warn(`admin login FAILED from ${ip}`);
+    return res.status(401).json({ error: "Invalid credentials" });
+  }
+  loginAttempts.delete(ip);
+  log.info(`admin login OK from ${ip}`);
+  res.setHeader(
+    "Set-Cookie",
+    `${ADMIN_COOKIE}=${signAdminToken()}; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=${ADMIN_TTL_MS / 1000}`
+  );
+  return res.json({ ok: true });
+});
+
+app.post("/api/admin/logout", (req, res) => {
+  if (!adminGuards(req, res)) return;
+  res.setHeader(
+    "Set-Cookie",
+    `${ADMIN_COOKIE}=; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=0`
+  );
+  return res.json({ ok: true });
+});
+
+app.get("/api/admin/clinics", async (req, res) => {
+  if (!adminGuards(req, res)) return;
+  if (!requireSuperAdmin(req)) {
+    return res.status(401).json({ error: "Session expired" });
+  }
+  try {
+    const clinics = await Clinic.find({})
+      .select(
+        "clinic_name doctor_name twilio_number plan_status plan_expires_at current_running_token last_assigned_token is_on_holiday createdAt"
+      )
+      .sort({ createdAt: -1 })
+      .lean();
+    return res.json({
+      clinics: clinics.map((c) => ({
+        id: c._id,
+        clinicName: c.clinic_name,
+        doctorName: c.doctor_name,
+        twilioNumber: c.twilio_number,
+        planStatus: c.plan_status,
+        planExpiresAt: c.plan_expires_at,
+        currentRunningToken: c.current_running_token,
+        lastAssignedToken: c.last_assigned_token,
+        isOnHoliday: c.is_on_holiday,
+      })),
+    });
+  } catch (err) {
+    log.error("/api/admin/clinics failed:", err);
+    return res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
 
@@ -866,4 +1094,8 @@ module.exports = {
   splitSentences,
   istDateKey,
   ensureFreshDay,
+  parseCookies,
+  verifyScryptHash,
+  signAdminToken,
+  verifyAdminToken,
 };

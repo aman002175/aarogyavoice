@@ -162,3 +162,69 @@ export async function cancelQueueToken(
     return false;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Super-admin console (hidden /aarogya-super-admin route)
+// Session lives in an HttpOnly cookie on the backend; the custom header is a
+// CSRF defense that cross-site pages cannot forge.
+// ---------------------------------------------------------------------------
+
+const ADMIN_HEADERS: HeadersInit = {
+  "Content-Type": "application/json",
+  "X-Aarogya-Admin": "1",
+};
+
+export interface AdminClinic {
+  id: string;
+  clinicName: string;
+  doctorName: string;
+  twilioNumber: string;
+  planStatus: string;
+  planExpiresAt: string | null;
+  currentRunningToken: number;
+  lastAssignedToken: number;
+  isOnHoliday: boolean;
+}
+
+type AdminResult<T> =
+  | { ok: true; data: T }
+  | { ok: false; status: number; error: string };
+
+async function adminFetch<T>(path: string, init?: RequestInit): Promise<AdminResult<T>> {
+  if (!isBackendConfigured) {
+    return { ok: false, status: 0, error: "NEXT_PUBLIC_BACKEND_URL is not set" };
+  }
+  try {
+    const res = await fetch(`${backendUrl}${path}`, {
+      credentials: "include",
+      ...init,
+      headers: { ...ADMIN_HEADERS, ...(init?.headers ?? {}) },
+    });
+    const body = (await res.json().catch(() => ({}))) as { error?: string } & T;
+    if (!res.ok) {
+      return { ok: false, status: res.status, error: body.error || `HTTP ${res.status}` };
+    }
+    return { ok: true, data: body as T };
+  } catch (err) {
+    console.error(`admin request failed: ${path}`, err);
+    return { ok: false, status: 0, error: "Network error" };
+  }
+}
+
+export function adminLogin(
+  adminId: string,
+  password: string,
+): Promise<AdminResult<{ ok: true }>> {
+  return adminFetch("/api/admin/login", {
+    method: "POST",
+    body: JSON.stringify({ adminId, password }),
+  });
+}
+
+export function fetchAdminClinics(): Promise<AdminResult<{ clinics: AdminClinic[] }>> {
+  return adminFetch("/api/admin/clinics");
+}
+
+export function adminLogout(): Promise<AdminResult<{ ok: true }>> {
+  return adminFetch("/api/admin/logout", { method: "POST" });
+}

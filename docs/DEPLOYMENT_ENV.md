@@ -45,6 +45,9 @@ secret nahi. Isliye frontend env me sirf ek variable chahiye.
 | `DEEPGRAM_LANGUAGE` | optional | default `multi` (Hinglish); `hi`/`en` pure |
 | `DEEPGRAM_TTS_MODEL` | optional | default `aura-asteria-en` (⚠️ English — Hindi voice console me verify karo) |
 | `TWILIO_SKIP_SIGNATURE_CHECK` | ❌ PROD ME KABHI NAHI | sirf local ngrok testing ke liye |
+| `SUPER_ADMIN_ID` | 🔒 SECRET | hidden `/aarogya-super-admin` console ka login ID (aap khud choose karo) |
+| `SUPER_ADMIN_PASSWORD_HASH` | 🔒 SECRET | `npm run hash-password -- "long-password"` se generate karo (scrypt) |
+| `ADMIN_SESSION_SECRET` | 🔒 SECRET | `openssl rand -base64 32` — admin session tokens sign karta hai |
 
 6. Deploy → verify: `GET https://xyz.up.railway.app/healthz` → `{"ok":true,...}`
 7. Clinic seed: Railway shell (ya locally `MONGO_URI` set karke):
@@ -98,4 +101,6 @@ secret nahi. Isliye frontend env me sirf ek variable chahiye.
 - [ ] `TWILIO_SKIP_SIGNATURE_CHECK` production me unset/false
 - [ ] Mongo URI (password ke sath) kabhi git me commit na ho
 - [ ] Key leak ho jaye to turant rotate karo (Twilio/Deepgram/Groq consoles)
+- [ ] Super admin: `SUPER_ADMIN_PASSWORD` (plaintext) ki jagah `SUPER_ADMIN_PASSWORD_HASH` use karo — 12+ char password, unique ID
+- [ ] `/aarogya-super-admin` ka URL kahin link/share mat karo — ye noindex hai aur codebase me iska koi gate/link nahi hai
 - [ ] Freebuff preview ko Live dikhana ho to: **Settings → Environment** me `NEXT_PUBLIC_BACKEND_URL` add karo

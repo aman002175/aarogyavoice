@@ -2,12 +2,11 @@
 
 import { Suspense, useState } from "react";
 import { motion } from "framer-motion";
-import { ArrowRight, Building2, ShieldCheck, Stethoscope } from "lucide-react";
+import { ArrowRight, ShieldCheck, Stethoscope } from "lucide-react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Logo } from "@/components/logo";
 import { Button } from "@/components/button";
-import { cn } from "@/lib/config";
 
 type Mode = "signin" | "signup";
 
@@ -18,7 +17,6 @@ function AuthForm() {
   const [mode, setMode] = useState<Mode>(
     params.get("mode") === "signup" ? "signup" : "signin",
   );
-  const [role, setRole] = useState<"doctor" | "admin">("doctor");
   const [loading, setLoading] = useState(false);
 
   function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
@@ -26,6 +24,15 @@ function AuthForm() {
     setLoading(true);
     // Frontend-only: the backend is not wired yet, so any valid submit lands
     // on the dashboard. Replace this with the real auth mutation later.
+    window.setTimeout(() => {
+      router.push(returnTo);
+    }, 600);
+  }
+
+  function continueWithGoogle() {
+    // Demo mode mirrors the email flow for now. Real Google OAuth replaces
+    // this once GOOGLE_CLIENT_ID/SECRET are wired on the backend.
+    setLoading(true);
     window.setTimeout(() => {
       router.push(returnTo);
     }, 600);
@@ -92,32 +99,7 @@ function AuthForm() {
               : "Sign in to manage your clinic, queue, and appointments."}
           </p>
 
-          {/* Role selector */}
-          <div className="mt-7 grid grid-cols-2 gap-2 rounded-lg bg-ink-900/5 p-1">
-            {(
-              [
-                { id: "doctor" as const, label: "Doctor / Clinic", icon: Stethoscope },
-                { id: "admin" as const, label: "Super Admin", icon: Building2 },
-              ]
-            ).map((option) => (
-              <button
-                key={option.id}
-                type="button"
-                onClick={() => setRole(option.id)}
-                className={cn(
-                  "flex items-center justify-center gap-2 rounded-md px-3 py-2.5 text-sm font-medium transition-colors",
-                  role === option.id
-                    ? "bg-white text-ink-900 shadow-[0_1px_3px_rgb(10_14_13/0.1)]"
-                    : "text-ink-600 hover:text-ink-900",
-                )}
-              >
-                <option.icon className="size-4" />
-                {option.label}
-              </button>
-            ))}
-          </div>
-
-          <form onSubmit={handleSubmit} className="mt-6 space-y-4">
+          <form onSubmit={handleSubmit} className="mt-7 space-y-4">
             {isSignup && (
               <div className="grid gap-4 sm:grid-cols-2">
                 <Field label="Doctor name" placeholder="Dr. Ananya Sharma" />
@@ -126,9 +108,9 @@ function AuthForm() {
             )}
 
             <Field
-              label={role === "admin" ? "Admin email" : "Email"}
+              label="Email"
               type="email"
-              placeholder={role === "admin" ? "admin@clinic.com" : "you@clinic.com"}
+              placeholder="you@clinic.com"
               required
             />
             <Field
@@ -150,6 +132,39 @@ function AuthForm() {
               )}
             </Button>
           </form>
+
+          <div className="mt-5 flex items-center gap-3 text-xs text-ink-400">
+            <span className="h-px flex-1 bg-ink-200" />
+            or
+            <span className="h-px flex-1 bg-ink-200" />
+          </div>
+
+          <button
+            type="button"
+            onClick={continueWithGoogle}
+            disabled={loading}
+            className="flex h-11 w-full items-center justify-center gap-3 rounded-lg border border-ink-200 bg-white text-sm font-medium text-ink-800 transition-colors hover:bg-ink-900/[0.03] disabled:opacity-60"
+          >
+            <svg className="size-4" viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                fill="#4285F4"
+                d="M23.5 12.3c0-.9-.1-1.5-.3-2.2H12v4.1h6.6c-.1 1.1-.8 2.7-2.4 3.8l-.02.15 3.5 2.7.24.02c2.2-2 3.5-5 3.5-8.6z"
+              />
+              <path
+                fill="#34A853"
+                d="M12 24c3.2 0 5.9-1.1 7.9-2.9l-3.8-2.9c-1 .7-2.4 1.2-4.1 1.2-3.2 0-5.8-2.1-6.8-5l-.14.01-3.6 2.8-.05.13C3.4 21.3 7.4 24 12 24z"
+              />
+              <path
+                fill="#FBBC05"
+                d="M5.2 14.4c-.2-.7-.4-1.5-.4-2.4s.1-1.6.4-2.4l-.01-.15-3.7-2.8-.12.06C.5 8.3 0 10.1 0 12s.5 3.7 1.4 5.3l3.8-2.9z"
+              />
+              <path
+                fill="#EA4335"
+                d="M12 4.6c2.3 0 3.8 1 4.7 1.8l3.4-3.3C18 1.2 15.2 0 12 0 7.4 0 3.4 2.7 1.4 6.7l3.8 2.9c1-2.9 3.6-5 6.8-5z"
+              />
+            </svg>
+            Continue with Google
+          </button>
 
           <p className="mt-6 text-center text-sm text-ink-600">
             {isSignup ? "Already have an account?" : "New to Aarogya Voice?"}{" "}
