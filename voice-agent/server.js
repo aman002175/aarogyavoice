@@ -417,12 +417,11 @@ app.post("/twilio/voice", async (req, res) => {
  */
 app.post("/api/clinic/next-token", async (req, res) => {
   try {
-    const { clinicId } = req.body || {};
-    if (!clinicId || !/^[a-f\d]{24}$/i.test(clinicId)) {
-      return res.status(400).json({ error: "clinicId (24-hex) is required" });
-    }
-    // TODO(auth): verify the dashboard JWT and that this user belongs to
-    // clinicId before mutating anything.
+    // Doctor JWT auth: the token's `sub` is the ONLY tenant this request may
+    // touch — a client-supplied clinicId is never trusted.
+    const auth = requireDoctor(req);
+    if (!auth) return res.status(401).json({ error: "Unauthorized" });
+    const clinicId = auth.sub;
 
     let clinic = await Clinic.findById(clinicId);
     if (!clinic) return res.status(404).json({ error: "Clinic not found" });
@@ -478,11 +477,13 @@ app.post("/api/clinic/next-token", async (req, res) => {
  */
 app.post("/api/clinic/cancel-token", async (req, res) => {
   try {
-    const { clinicId, tokenNumber } = req.body || {};
-    if (!clinicId || !/^[a-f\d]{24}$/i.test(clinicId) || !Number.isInteger(tokenNumber)) {
-      return res.status(400).json({ error: "clinicId (24-hex) and integer tokenNumber are required" });
+    const auth = requireDoctor(req);
+    if (!auth) return res.status(401).json({ error: "Unauthorized" });
+    const { tokenNumber } = req.body || {};
+    if (!Number.isInteger(tokenNumber)) {
+      return res.status(400).json({ error: "integer tokenNumber is required" });
     }
-    // TODO(auth): verify the dashboard JWT and clinic membership.
+    const clinicId = auth.sub;
 
     const updated = await Appointment.findOneAndUpdate(
       { clinic_id: clinicId, token_number: tokenNumber, day: "today", status: "WAITING" },
@@ -503,6 +504,9 @@ app.post("/api/clinic/cancel-token", async (req, res) => {
 /** Initial dashboard hydration before the Socket.io subscription kicks in. */
 app.get("/api/clinic/:id/state", async (req, res) => {
   try {
+    const auth = requireDoctor(req);
+    if (!auth) return res.status(401).json({ error: "Unauthorized" });
+    if (auth.sub !== req.params.id) return res.status(403).json({ error: "Forbidden" });
     const clinic = await Clinic.findById(req.params.id);
     if (!clinic) return res.status(404).json({ error: "Clinic not found" });
     const waiting = await Appointment.find({ clinic_id: clinic._id, status: "WAITING", day: "today" })
@@ -527,11 +531,16 @@ const io = new SocketServer(server, {
 });
 
 io.on("connection", (socket) => {
-  const clinicId = socket.handshake.auth?.clinicId;
-  if (clinicId && /^[a-f\d]{24}$/i.test(clinicId)) {
-    socket.join(`clinic:${clinicId}`);
-    log.info(`socket ${socket.id} subscribed to clinic:${clinicId}`);
+  // Room membership requires a valid doctor JWT — the token's `sub` decides
+  // the room; a client-supplied clinicId is never trusted.
+  const auth = verifyDoctorToken(socket.handshake.auth?.token);
+  if (!auth) {
+    log.warn(`socket ${socket.id} rejected — missing/expired doctor token`);
+    socket.disconnect(true);
+    return;
   }
+  socket.join(`clinic:${auth.sub}`);
+  log.info(`socket ${socket.id} subscribed to clinic:${auth.sub}`);
   socket.on("clinic:unsubscribe", (id) => {
     if (id) socket.leave(`clinic:${id}`);
   });
@@ -1052,6 +1061,145 @@ app.get("/api/admin/clinics", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Doctor (dashboard) auth — dependency-free HMAC-SHA256 JWT
+// ---------------------------------------------------------------------------
+
+const DOCTOR_TTL_MS = 12 * 60 * 60 * 1000;
+// Dedicated secret; falls back to the admin secret so small deployments need
+// one less env var. Rotating either invalidates the sessions signed with it.
+const doctorSecret = () =>
+  process.env.DOCTOR_JWT_SECRET || process.env.ADMIN_SESSION_SECRET || "";
+
+function scryptHashFor(password) {
+  const salt = crypto.randomBytes(16);
+  const hash = crypto.scryptSync(String(password), salt, 64, { N: 16384, r: 8, p: 1 });
+  return `scrypt$16384$8$1$${salt.toString("hex")}$${hash.toString("hex")}`;
+}
+// Verified against when the email does not exist, so login timing does not
+// reveal whether an account exists (user-enumeration defense).
+const DUMMY_SCRYPT_HASH = scryptHashFor("timing-equalizer-dummy");
+
+function signDoctorToken(clinicId, ttlMs = DOCTOR_TTL_MS) {
+  const payload = Buffer.from(
+    JSON.stringify({
+      role: "doctor",
+      sub: String(clinicId),
+      iat: Date.now(),
+      exp: Date.now() + ttlMs,
+    })
+  ).toString("base64url");
+  const sig = crypto
+    .createHmac("sha256", doctorSecret())
+    .update(payload)
+    .digest("base64url");
+  return `${payload}.${sig}`;
+}
+
+function verifyDoctorToken(token) {
+  const secret = doctorSecret();
+  if (!token || !secret) return null;
+  const [payload, sig] = String(token).split(".");
+  if (!payload || !sig) return null;
+  const expected = crypto
+    .createHmac("sha256", secret)
+    .update(payload)
+    .digest("base64url");
+  const a = Buffer.from(sig);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  try {
+    const data = JSON.parse(Buffer.from(payload, "base64url").toString());
+    if (
+      data.role !== "doctor" ||
+      typeof data.exp !== "number" ||
+      data.exp <= Date.now() ||
+      typeof data.sub !== "string" ||
+      !/^[a-f\d]{24}$/i.test(data.sub)
+    ) {
+      return null;
+    }
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+/** Extracts and verifies the `Authorization: Bearer <jwt>` doctor token. */
+function requireDoctor(req) {
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+  return verifyDoctorToken(token);
+}
+
+app.post("/api/auth/doctor-login", async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    if (
+      typeof email !== "string" ||
+      typeof password !== "string" ||
+      !email.trim() ||
+      !password
+    ) {
+      return res.status(400).json({ error: "email and password are required" });
+    }
+    const emailKey = email.trim().toLowerCase();
+    const clinic = await Clinic.findOne({ email: emailKey }).select(
+      "password_hash is_active clinic_name doctor_name twilio_number"
+    );
+    const hash =
+      typeof clinic?.password_hash === "string" ? clinic.password_hash : "";
+    // Always run one scrypt verify so response timing is similar for unknown
+    // emails and wrong passwords.
+    const passOk = verifyScryptHash(
+      password,
+      /^scrypt\$/.test(hash) ? hash : DUMMY_SCRYPT_HASH
+    );
+    if (!clinic || !clinic.is_active || !passOk) {
+      await new Promise((r) => setTimeout(r, 400)); // slow online guessing
+      log.warn(`doctor login FAILED for ${emailKey}`);
+      return res.status(401).json({ error: "Invalid email or password" });
+    }
+    log.info(`doctor login OK for clinic ${clinic._id}`);
+    return res.json({
+      token: signDoctorToken(clinic._id.toString()),
+      expiresInMs: DOCTOR_TTL_MS,
+      clinic: {
+        id: clinic._id,
+        clinicName: clinic.clinic_name,
+        doctorName: clinic.doctor_name,
+        twilioNumber: clinic.twilio_number,
+      },
+    });
+  } catch (err) {
+    log.error("/api/auth/doctor-login failed:", err);
+    return res.status(500).json({ error: "Internal error" });
+  }
+});
+
+/** Who am I — lets the dashboard re-hydrate the workspace after a refresh. */
+app.get("/api/auth/doctor-me", async (req, res) => {
+  const auth = requireDoctor(req);
+  if (!auth) return res.status(401).json({ error: "Unauthorized" });
+  try {
+    const clinic = await Clinic.findById(auth.sub).select(
+      "clinic_name doctor_name twilio_number"
+    );
+    if (!clinic) return res.status(404).json({ error: "Clinic not found" });
+    return res.json({
+      clinic: {
+        id: clinic._id,
+        clinicName: clinic.clinic_name,
+        doctorName: clinic.doctor_name,
+        twilioNumber: clinic.twilio_number,
+      },
+    });
+  } catch (err) {
+    log.error("/api/auth/doctor-me failed:", err);
+    return res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
 
@@ -1098,4 +1246,6 @@ module.exports = {
   verifyScryptHash,
   signAdminToken,
   verifyAdminToken,
+  signDoctorToken,
+  verifyDoctorToken,
 };

@@ -5,19 +5,29 @@
  * clinic row must exist with `twilio_number` set before any call can work.
  *
  * Usage:
- *   node seed.js +911140001234 "Sharma Dental Care"
- *   npm run seed -- +911140001234 "Sharma Dental Care"
+ *   node seed.js +911140001234 "Sharma Dental Care" [doctorPassword]
+ *   npm run seed -- +911140001234 "Sharma Dental Care" "s3cret-password"
+ *
+ * The optional password enables /api/auth/doctor-login for this clinic
+ * (scrypt-hashed, same scheme as hash-password.js).
  */
 require("dotenv").config();
 
+const crypto = require("crypto");
 const mongoose = require("mongoose");
 const { Clinic } = require("./models");
 
+function scryptHashFor(password) {
+  const salt = crypto.randomBytes(16);
+  const hash = crypto.scryptSync(String(password), salt, 64, { N: 16384, r: 8, p: 1 });
+  return `scrypt$16384$8$1$${salt.toString("hex")}$${hash.toString("hex")}`;
+}
+
 async function main() {
-  const [number, clinicName] = process.argv.slice(2);
+  const [number, clinicName, doctorPassword] = process.argv.slice(2);
   if (!number || !/^\+\d{8,15}$/.test(number)) {
     console.error(
-      'Usage: node seed.js +911140001234 "Clinic Name"  (E.164, e.g. your Twilio number)'
+      'Usage: node seed.js +911140001234 "Clinic Name" [doctorPassword]  (E.164, e.g. your Twilio number)'
     );
     process.exit(1);
   }
@@ -37,7 +47,9 @@ async function main() {
         doctor_name: "Dr. Ananya Sharma",
         clinic_name: clinicName || "Aarogya Dental Care",
         email: `demo+${number.replace(/\D/g, "")}@aarogyavoice.com`,
-        password_hash: "set-me-later", // doctor auth is not implemented yet
+        password_hash: doctorPassword
+          ? scryptHashFor(doctorPassword)
+          : "set-me-later", // without a password, doctor login stays disabled
         twilio_number: number,
         is_active: true,
         avg_minutes_per_token: 15,
@@ -48,7 +60,7 @@ async function main() {
   );
 
   console.log(
-    `Clinic ready:\n  id            ${clinic._id.toString()}\n  clinic_name   ${clinic.clinic_name}\n  twilio_number ${clinic.twilio_number}\n  tokens        current=${clinic.current_running_token} last_assigned=${clinic.last_assigned_token}`
+    `Clinic ready:\n  id            ${clinic._id.toString()}\n  clinic_name   ${clinic.clinic_name}\n  email         ${clinic.email}\n  twilio_number ${clinic.twilio_number}\n  doctor login  ${doctorPassword ? "ENABLED (use the email above)" : "disabled — pass a password to enable"}\n  tokens        current=${clinic.current_running_token} last_assigned=${clinic.last_assigned_token}`
   );
 
   await mongoose.connection.close(false);

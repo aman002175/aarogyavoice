@@ -1,5 +1,18 @@
 #  Pricing Strategy & Execution Plan
 
+> ## ✅ FINAL PRICING DECISION (2026-10, cost-verified)
+> Verified COGS: Twilio inbound $0.0496/min + Media Streams $0.0044/min,
+> Deepgram STT+TTS ~$0.0048/min, Groq ~$0.0030/min → **~₹5.3/min**.
+> The older model in §2 below (₹1,499/300min and ₹1.42/min COGS) **loses money
+> and uses outdated cost inputs — superseded by the decision below.**
+>
+> **Starter — ₹4,999/month, 800 voice minutes included, then ₹3/minute.**
+> Margin: ₹4,999 − (800 × ₹5.3 ≈ ₹4,240) ≈ **₹760**; heavy users (₹3/min
+> overage vs ₹5.3 COGS) still lose ~₹2.3/overage-min — revisit overage to ₹6–7
+> before scaling paid ads. [Unit economics section needs a fresh pass.]
+> Final margins need re-validation against current provider pricing.
+
+
 ## 1. Unit Economics (Per Clinic / Month)
 Based on realistic usage of **2,000 minutes/month** (approx. 30 calls/day).
 
@@ -15,6 +28,10 @@ Based on realistic usage of **2,000 minutes/month** (approx. 30 calls/day).
 
 ## 2. SaaS Pricing Model (What Doctors Pay)
 Do not sell "minutes". Sell "Peace of Mind".
+
+> ⚠️ At the verified ~₹5.3/min COGS, the old ₹1,499/300min model **loses
+> money** and the ₹3/min overage runs under water — see the banner at the top
+> of this file. Anchor is now **₹4,999/month / 800 minutes**.
 
 - **One-Time Setup Fee:** **₹2,999** (Covers Twilio number, onboarding, prompt tuning).
 - **Monthly Subscription:** **₹7,999 / month** (Includes up to 2,500 minutes).

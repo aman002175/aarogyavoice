@@ -44,15 +44,26 @@ export interface TokenAdvancedEvent {
 
 let socket: Socket | null = null;
 
-/** Process-wide Socket.io connection, subscribed to one clinic's room. */
+/**
+ * Process-wide Socket.io connection, subscribed to one clinic's room.
+ * The doctor JWT goes in the handshake — the backend derives the room from
+ * the token's `sub`, so a client-supplied clinicId is never trusted.
+ * If the signed-in clinic changes (login after mount), the connection is
+ * recreated because the handshake auth is fixed at connect time.
+ */
 export function getQueueSocket(clinicId: string): Socket {
   if (!isBackendConfigured) {
     throw new Error("NEXT_PUBLIC_BACKEND_URL is not set");
   }
+  const token = getDoctorToken() ?? undefined;
+  if (socket && (socket.auth as { clinicId?: string } | undefined)?.clinicId !== clinicId) {
+    socket.disconnect();
+    socket = null;
+  }
   if (!socket) {
     socket = io(backendUrl, {
       transports: ["websocket"],
-      auth: { clinicId },
+      auth: { clinicId, token },
     });
   }
   if (!socket.connected) {
@@ -74,7 +85,7 @@ export async function advanceQueue(
   try {
     const res = await fetch(`${backendUrl}/api/clinic/next-token`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: doctorAuthHeaders(),
       body: JSON.stringify({ clinicId }),
     });
     if (!res.ok) {
@@ -125,7 +136,9 @@ export async function fetchClinicState(
 ): Promise<ClinicStateResponse | null> {
   if (!isBackendConfigured) return null;
   try {
-    const res = await fetch(`${backendUrl}/api/clinic/${clinicId}/state`);
+    const res = await fetch(`${backendUrl}/api/clinic/${clinicId}/state`, {
+      headers: doctorAuthHeaders(),
+    });
     if (!res.ok) {
       console.error(`clinic state failed: ${res.status}`);
       return null;
@@ -146,7 +159,7 @@ export async function cancelQueueToken(
   try {
     const res = await fetch(`${backendUrl}/api/clinic/cancel-token`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: doctorAuthHeaders(),
       body: JSON.stringify({ clinicId, tokenNumber }),
     });
     if (!res.ok) {
@@ -160,6 +173,119 @@ export async function cancelQueueToken(
   } catch (err) {
     console.error("cancel-token request failed:", err);
     return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Doctor auth (dashboard)
+// JWT is kept in localStorage (per-tab usable). The backend derives the
+// tenant from the token's `sub` — the client never supplies a clinicId for
+// authorization decisions. Login errors are intentionally generic.
+// ---------------------------------------------------------------------------
+
+const DOCTOR_TOKEN_KEY = "aarogya_doctor_token";
+
+export function getDoctorToken(): string | null {
+  if (typeof window === "undefined") return null;
+  return localStorage.getItem(DOCTOR_TOKEN_KEY);
+}
+
+export function setDoctorToken(token: string): void {
+  try {
+    localStorage.setItem(DOCTOR_TOKEN_KEY, token);
+  } catch {
+    // Private mode / storage quota — the session just won't persist.
+  }
+}
+
+export function clearDoctorToken(): void {
+  try {
+    localStorage.removeItem(DOCTOR_TOKEN_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+const DOCTOR_WORKSPACE_KEY = "aarogya_doctor_workspace";
+
+/** Cached workspace snapshot (id/name) so the UI can hydrate before /me. */
+export function setDoctorWorkspace(ws: DoctorWorkspace): void {
+  try {
+    localStorage.setItem(DOCTOR_WORKSPACE_KEY, JSON.stringify(ws));
+  } catch {
+    // ignore
+  }
+}
+
+export function getDoctorWorkspace(): DoctorWorkspace | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(DOCTOR_WORKSPACE_KEY);
+    return raw ? (JSON.parse(raw) as DoctorWorkspace) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Authorization header for clinic endpoints (Content-Type included). */
+export function doctorAuthHeaders(): Record<string, string> {
+  const token = getDoctorToken();
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return headers;
+}
+
+export interface DoctorWorkspace {
+  id: string;
+  clinicName: string;
+  doctorName: string;
+  twilioNumber: string;
+}
+
+export async function doctorLogin(
+  email: string,
+  password: string,
+): Promise<AdminResult<{ token: string; expiresInMs: number; clinic: DoctorWorkspace }>> {
+  if (!isBackendConfigured) {
+    return { ok: false, status: 0, error: "NEXT_PUBLIC_BACKEND_URL is not set" };
+  }
+  try {
+    const res = await fetch(`${backendUrl}/api/auth/doctor-login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    if (!res.ok) {
+      return { ok: false, status: res.status, error: body.error || `HTTP ${res.status}` };
+    }
+    return {
+      ok: true,
+      data: body as { token: string; expiresInMs: number; clinic: DoctorWorkspace },
+    };
+  } catch (err) {
+    console.error("doctor-login request failed:", err);
+    return { ok: false, status: 0, error: "Network error" };
+  }
+}
+
+/** Who am I — re-hydrates the workspace after a refresh using the stored JWT. */
+export async function fetchDoctorMe(): Promise<AdminResult<{ clinic: DoctorWorkspace }>> {
+  if (!isBackendConfigured) {
+    return { ok: false, status: 0, error: "NEXT_PUBLIC_BACKEND_URL is not set" };
+  }
+  try {
+    const res = await fetch(`${backendUrl}/api/auth/doctor-me`, {
+      headers: doctorAuthHeaders(),
+    });
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    if (!res.ok) {
+      return { ok: false, status: res.status, error: body.error || `HTTP ${res.status}` };
+    }
+    return { ok: true, data: body as { clinic: DoctorWorkspace } };
+  } catch (err) {
+    console.error("doctor-me request failed:", err);
+    return { ok: false, status: 0, error: "Network error" };
   }
 }
 

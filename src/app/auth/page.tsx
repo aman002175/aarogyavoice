@@ -7,6 +7,12 @@ import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Logo } from "@/components/logo";
 import { Button } from "@/components/button";
+import {
+  doctorLogin,
+  isBackendConfigured,
+  setDoctorToken,
+  setDoctorWorkspace,
+} from "@/lib/backend";
 
 type Mode = "signin" | "signup";
 
@@ -18,12 +24,36 @@ function AuthForm() {
     params.get("mode") === "signup" ? "signup" : "signin",
   );
   const [loading, setLoading] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
 
   function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    const email = String(data.get("email") || "").trim();
+    const password = String(data.get("password") || "");
+    setAuthError(null);
     setLoading(true);
-    // Frontend-only: the backend is not wired yet, so any valid submit lands
-    // on the dashboard. Replace this with the real auth mutation later.
+
+    // Sign-in against the voice-agent when it is configured. Signup and the
+    // no-backend demo path stay frontend-only until doctor signup exists.
+    if (mode === "signin" && isBackendConfigured) {
+      void doctorLogin(email, password).then((result) => {
+        if (!result.ok) {
+          setAuthError(
+            result.status === 401
+              ? "Invalid email or password."
+              : result.error,
+          );
+          setLoading(false);
+          return;
+        }
+        setDoctorToken(result.data.token);
+        setDoctorWorkspace(result.data.clinic);
+        router.push(returnTo);
+      });
+      return;
+    }
+
     window.setTimeout(() => {
       router.push(returnTo);
     }, 600);
@@ -120,6 +150,12 @@ function AuthForm() {
               required
               minLength={8}
             />
+
+            {authError && (
+              <p className="rounded-lg border border-red-200 bg-red-50 px-3.5 py-2.5 text-sm text-red-700">
+                {authError}
+              </p>
+            )}
 
             <Button type="submit" size="lg" className="group w-full" disabled={loading}>
               {loading

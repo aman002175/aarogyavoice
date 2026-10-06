@@ -45,6 +45,7 @@ secret nahi. Isliye frontend env me sirf ek variable chahiye.
 | `DEEPGRAM_LANGUAGE` | optional | default `multi` (Hinglish); `hi`/`en` pure |
 | `DEEPGRAM_TTS_MODEL` | optional | default `aura-asteria-en` (⚠️ English — Hindi voice console me verify karo) |
 | `TWILIO_SKIP_SIGNATURE_CHECK` | ❌ PROD ME KABHI NAHI | sirf local ngrok testing ke liye |
+| `DOCTOR_JWT_SECRET` | 🔒 SECRET | doctor (dashboard) JWT sessions sign karta hai; unset hone par ADMIN_SESSION_SECRET fallback |
 | `SUPER_ADMIN_ID` | 🔒 SECRET | hidden `/aarogya-super-admin` console ka login ID (aap khud choose karo) |
 | `SUPER_ADMIN_PASSWORD_HASH` | 🔒 SECRET | `npm run hash-password -- "long-password"` se generate karo (scrypt) |
 | `ADMIN_SESSION_SECRET` | 🔒 SECRET | `openssl rand -base64 32` — admin session tokens sign karta hai |

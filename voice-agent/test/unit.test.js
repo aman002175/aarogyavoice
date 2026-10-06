@@ -19,6 +19,8 @@ const {
   verifyScryptHash,
   signAdminToken,
   verifyAdminToken,
+  signDoctorToken,
+  verifyDoctorToken,
 } = require("../server.js");
 const crypto = require("crypto");
 
@@ -160,4 +162,47 @@ test("admin session token: sign -> verify, and tamper/expiry rejection", () => {
   process.env.ADMIN_SESSION_SECRET = "a-different-secret";
   assert.equal(verifyAdminToken(other), false); // wrong signing secret
   process.env.ADMIN_SESSION_SECRET = "test-secret-for-unit-tests-only";
+});
+
+test("doctor JWT: sign -> verify carries clinic sub, rejects tamper/expiry/wrong secret", () => {
+  process.env.DOCTOR_JWT_SECRET = "test-doctor-secret-for-unit-tests-only";
+  const clinicId = "64b1f0c9a1b2c3d4e5f60718";
+  const token = signDoctorToken(clinicId, 60_000);
+  const verified = verifyDoctorToken(token);
+  assert.ok(verified, "token should verify");
+  assert.equal(verified.sub, clinicId);
+  assert.equal(verified.role, "doctor");
+
+  const [payload, sig] = token.split(".");
+  const tamperedSig = Buffer.from("x").toString("base64url");
+  assert.equal(verifyDoctorToken(`${payload}.${tamperedSig}`), null);
+  assert.equal(verifyDoctorToken(payload), null);
+  assert.equal(verifyDoctorToken(""), null);
+  assert.equal(verifyDoctorToken(null), null);
+
+  const expired = signDoctorToken(clinicId, -1_000); // already expired
+  assert.equal(verifyDoctorToken(expired), null);
+
+  // The token's sub must be a 24-hex clinic id — the only tenant it grants.
+  const badSub = signDoctorToken("not-a-clinic-id", 60_000);
+  assert.equal(verifyDoctorToken(badSub), null);
+
+  // Wrong signing secret must fail.
+  const other = signDoctorToken(clinicId, 60_000);
+  process.env.DOCTOR_JWT_SECRET = "a-different-doctor-secret";
+  assert.equal(verifyDoctorToken(other), null);
+
+  // Secret unset -> fail closed (no fallback in tests because we set one).
+  delete process.env.DOCTOR_JWT_SECRET;
+  delete process.env.ADMIN_SESSION_SECRET;
+  assert.equal(verifyDoctorToken(other), null);
+  process.env.DOCTOR_JWT_SECRET = "test-doctor-secret-for-unit-tests-only";
+});
+
+test("doctor JWT falls back to ADMIN_SESSION_SECRET when DOCTOR_JWT_SECRET unset", () => {
+  delete process.env.DOCTOR_JWT_SECRET;
+  process.env.ADMIN_SESSION_SECRET = "fallback-secret-doctor-tests";
+  const token = signDoctorToken("64b1f0c9a1b2c3d4e5f60718", 60_000);
+  assert.ok(verifyDoctorToken(token), "fallback secret should verify");
+  delete process.env.ADMIN_SESSION_SECRET;
 });
